@@ -3,7 +3,7 @@
  * through Lawrence Berkeley National Laboratory (subject to receipt of
  * any required approvals from the U.S. Dept. of Energy).
  *
- * (c) 2024-2026, Microsoft Corporation
+ * (c) 2024-2025, Microsoft Corporation
  *
  * All rights reserved.
  *
@@ -14,156 +14,78 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
-#include <stdexcept>
+#include <memory>
 #include <string>
 #include <vector>
-
-#ifdef _OPENMP
-#include <omp.h>
-#endif
 
 #include <gauxc/exceptions.hpp>
 
 namespace GauXC {
 
-// =============================================================================
-// CubeGrid
-// =============================================================================
-
-CubeGrid CubeGrid::from_molecule(const Molecule& mol, int64_t nx, int64_t ny,
-                                 int64_t nz, double margin) {
-  if (mol.empty()) {
-    GAUXC_GENERIC_EXCEPTION(
-        "CubeGrid::from_molecule: molecule has no atoms.");
-  }
-  if (nx < 1 || ny < 1 || nz < 1) {
-    GAUXC_GENERIC_EXCEPTION(
-        "CubeGrid::from_molecule: nx, ny, nz must be >= 1.");
-  }
-
-  double xmin = mol[0].x, xmax = mol[0].x;
-  double ymin = mol[0].y, ymax = mol[0].y;
-  double zmin = mol[0].z, zmax = mol[0].z;
-  for (const auto& a : mol) {
-    xmin = std::min(xmin, a.x);
-    xmax = std::max(xmax, a.x);
-    ymin = std::min(ymin, a.y);
-    ymax = std::max(ymax, a.y);
-    zmin = std::min(zmin, a.z);
-    zmax = std::max(zmax, a.z);
-  }
-
-  CubeGrid grid;
-  grid.origin = {xmin - margin, ymin - margin, zmin - margin};
-  grid.nx = nx;
-  grid.ny = ny;
-  grid.nz = nz;
-  const double ex = (xmax - xmin) + 2.0 * margin;
-  const double ey = (ymax - ymin) + 2.0 * margin;
-  const double ez = (zmax - zmin) + 2.0 * margin;
-  grid.spacing[0] = nx > 1 ? ex / static_cast<double>(nx - 1) : 0.0;
-  grid.spacing[1] = ny > 1 ? ey / static_cast<double>(ny - 1) : 0.0;
-  grid.spacing[2] = nz > 1 ? ez / static_cast<double>(nz - 1) : 0.0;
-  return grid;
-}
-
-std::vector<double> CubeGrid::points() const {
-  std::vector<double> pts(static_cast<size_t>(num_points()) * 3);
-  points_into(pts.data());
-  return pts;
-}
-
-void CubeGrid::points_into(double* out) const {
-  size_t k = 0;
-  for (int64_t ix = 0; ix < nx; ++ix) {
-    const double x = origin[0] + spacing[0] * static_cast<double>(ix);
-    for (int64_t iy = 0; iy < ny; ++iy) {
-      const double y = origin[1] + spacing[1] * static_cast<double>(iy);
-      for (int64_t iz = 0; iz < nz; ++iz) {
-        const double z = origin[2] + spacing[2] * static_cast<double>(iz);
-        out[3 * k + 0] = x;
-        out[3 * k + 1] = y;
-        out[3 * k + 2] = z;
-        ++k;
-      }
-    }
-  }
-}
-
-// Hand-rolled %13.5E formatter. Required field is fixed 13 chars
-// (sign + D + '.' + 5d + 'E' + sign + 2d). snprintf in the inner loop
-// dominates write time on large grids; this matches glibc snprintf
-// bit-for-bit on the fast path (1-2 digit exponents) and falls back to
-// snprintf for 3-digit-exponent edge cases. Output buffer must be
-// exactly 13 bytes (no trailing NUL).
-
 namespace {
 
-inline void format_e13_5(double v, char* out) {
-  if (std::isnan(v)) {
-    std::memcpy(out, "          NaN", 13);
+/** @brief Format `v` as a fixed 13-character "%13.5E" field.
+ *
+ *  Layout: sign + D + '.' + 5 digits + 'E' + sign + 2 digits. snprintf in
+ *  the inner loop dominates write time on large grids; this reproduces glibc
+ *  "%13.5E" for every value except exact half-way ties in the 6th significant
+ *  digit, where glibc rounds the exact binary value half-to-even while this
+ *  routine rounds half-away-from-zero. Both agree to within one unit of the
+ *  last printed digit. 3-digit exponents defer to snprintf.
+ *
+ *  @param[in]  v   Value to format.
+ *  @param[out] out Exactly 13 bytes are written (no trailing NUL).
+ */
+inline void format_e13_5( double v, char* out ) {
+
+  if( std::isnan(v) ) {
+    std::memcpy( out, std::signbit(v) ? "         -NAN" : "          NAN", 13 );
     return;
   }
-  if (std::isinf(v)) {
-    std::memcpy(out, v < 0 ? "         -Inf" : "          Inf", 13);
+  if( std::isinf(v) ) {
+    std::memcpy( out, v < 0 ? "         -INF" : "          INF", 13 );
     return;
   }
 
-  bool negative = std::signbit(v);
-  double absv = std::fabs(v);
+  const bool negative = std::signbit(v);
+  const double absv = std::fabs(v);
 
-  if (absv == 0.0) {
+  if( absv == 0.0 ) {
     // glibc "%13.5E":  0.0 -> "  0.00000E+00";  -0.0 -> " -0.00000E+00".
-    out[0] = ' ';
-    out[1] = negative ? '-' : ' ';
-    out[2] = '0';
-    out[3] = '.';
-    out[4] = '0';
-    out[5] = '0';
-    out[6] = '0';
-    out[7] = '0';
-    out[8] = '0';
-    out[9] = 'E';
-    out[10] = '+';
-    out[11] = '0';
-    out[12] = '0';
+    std::memcpy( out, negative ? " -0.00000E+00" : "  0.00000E+00", 13 );
     return;
   }
 
   // Exponent via floor(log10), with corrections for FP edge cases
   // (e.g. 9.99999 rounding up across a power-of-ten boundary).
-  int exp10 = static_cast<int>(std::floor(std::log10(absv)));
-  double scale = std::pow(10.0, -exp10);
+  int exp10 = static_cast<int>( std::floor( std::log10(absv) ) );
+  double scale = std::pow( 10.0, -exp10 );
   double mant = absv * scale;
 
-  long long mant_int = static_cast<long long>(std::llround(mant * 1e5));
-  if (mant_int >= 1000000) {
+  long long mant_int = std::llround( mant * 1e5 );
+  if( mant_int >= 1000000 ) {
     mant_int = 100000;
     ++exp10;
-  } else if (mant_int < 100000) {
+  } else if( mant_int < 100000 ) {
     --exp10;
-    scale = std::pow(10.0, -exp10);
+    scale = std::pow( 10.0, -exp10 );
     mant = absv * scale;
-    mant_int = static_cast<long long>(std::llround(mant * 1e5));
-    if (mant_int >= 1000000) {
-      mant_int = 999999;
-    } else if (mant_int < 100000) {
-      mant_int = 100000;
-    }
+    mant_int = std::llround( mant * 1e5 );
+    if( mant_int >= 1000000 )     mant_int = 999999;
+    else if( mant_int < 100000 )  mant_int = 100000;
   }
 
   // 3+ digit exponents have a different field layout; defer to snprintf.
-  if (exp10 > 99 || exp10 < -99) {
+  if( exp10 > 99 or exp10 < -99 ) {
     char tmp[32];
-    const int n = std::snprintf(tmp, sizeof(tmp), "%13.5E", v);
-    if (n >= 13) {
-      std::memcpy(out, tmp + (n - 13), 13);
+    const int n = std::snprintf( tmp, sizeof(tmp), "%13.5E", v );
+    if( n >= 13 ) {
+      std::memcpy( out, tmp + (n - 13), 13 );
     } else {
       const int pad = 13 - n;
-      for (int i = 0; i < pad; ++i) out[i] = ' ';
-      std::memcpy(out + pad, tmp, static_cast<size_t>(n));
+      for( int i = 0; i < pad; ++i ) out[i] = ' ';
+      std::memcpy( out + pad, tmp, static_cast<size_t>(n) );
     }
     return;
   }
@@ -173,8 +95,8 @@ inline void format_e13_5(double v, char* out) {
   out[1] = negative ? '-' : ' ';
 
   char digits[6];
-  for (int i = 5; i >= 0; --i) {
-    digits[i] = static_cast<char>('0' + (mant_int % 10));
+  for( int i = 5; i >= 0; --i ) {
+    digits[i] = static_cast<char>( '0' + (mant_int % 10) );
     mant_int /= 10;
   }
   out[2] = digits[0];
@@ -188,116 +110,105 @@ inline void format_e13_5(double v, char* out) {
   out[10] = exp10 < 0 ? '-' : '+';
 
   const int aexp = exp10 < 0 ? -exp10 : exp10;
-  out[11] = static_cast<char>('0' + (aexp / 10));
-  out[12] = static_cast<char>('0' + (aexp % 10));
+  out[11] = static_cast<char>( '0' + (aexp / 10) );
+  out[12] = static_cast<char>( '0' + (aexp % 10) );
+
 }
 
 }  // namespace
 
-// =============================================================================
-// write_cube
-// =============================================================================
 
-void write_cube(const std::string& path, const Molecule& mol,
-                const CubeGrid& grid, const double* field,
-                const std::string& comment) {
-  if (field == nullptr) {
+void write_cube( const std::string& path, const Molecule& mol,
+                 const CubeGrid& grid, const double* field,
+                 const std::string& comment ) {
+
+  if( not field ) {
     GAUXC_GENERIC_EXCEPTION("write_cube: field pointer is null.");
   }
-  if (grid.num_points() <= 0) {
+  if( grid.num_points() <= 0 ) {
     GAUXC_GENERIC_EXCEPTION("write_cube: grid has zero points.");
   }
 
-  std::FILE* f = std::fopen(path.c_str(), "w");
-  if (f == nullptr) {
+  std::FILE* f = std::fopen( path.c_str(), "w" );
+  if( not f ) {
     GAUXC_GENERIC_EXCEPTION("write_cube: failed to open output file: " + path);
   }
+  std::unique_ptr<std::FILE, int(*)(std::FILE*)> fh( f, &std::fclose );
 
   // --- Header ---
-  std::fprintf(f, "%s\n",
-               comment.empty() ? "GauXC cube file" : comment.c_str());
-  std::fprintf(f, "Generated by GauXC\n");
+  std::fprintf( f, "%s\n",
+    comment.empty() ? "GauXC cube file" : comment.c_str() );
+  std::fprintf( f, "Generated by GauXC\n" );
 
   // natoms + origin (Bohr).
-  std::fprintf(f, "%5lld %12.6f %12.6f %12.6f\n",
-               static_cast<long long>(mol.size()), grid.origin[0],
-               grid.origin[1], grid.origin[2]);
+  std::fprintf( f, "%5lld %12.6f %12.6f %12.6f\n",
+    static_cast<long long>(mol.size()), grid.origin[0], grid.origin[1],
+    grid.origin[2] );
 
   // Three voxel-axis lines (axis-aligned grid).
-  std::fprintf(f, "%5lld %12.6f %12.6f %12.6f\n",
-               static_cast<long long>(grid.nx), grid.spacing[0], 0.0, 0.0);
-  std::fprintf(f, "%5lld %12.6f %12.6f %12.6f\n",
-               static_cast<long long>(grid.ny), 0.0, grid.spacing[1], 0.0);
-  std::fprintf(f, "%5lld %12.6f %12.6f %12.6f\n",
-               static_cast<long long>(grid.nz), 0.0, 0.0, grid.spacing[2]);
+  std::fprintf( f, "%5lld %12.6f %12.6f %12.6f\n",
+    static_cast<long long>(grid.nx), grid.spacing[0], 0.0, 0.0 );
+  std::fprintf( f, "%5lld %12.6f %12.6f %12.6f\n",
+    static_cast<long long>(grid.ny), 0.0, grid.spacing[1], 0.0 );
+  std::fprintf( f, "%5lld %12.6f %12.6f %12.6f\n",
+    static_cast<long long>(grid.nz), 0.0, 0.0, grid.spacing[2] );
 
   // One line per atom: Z, partial charge (0.0), x, y, z (Bohr).
-  for (const auto& atom : mol) {
-    std::fprintf(f, "%5lld %12.6f %12.6f %12.6f %12.6f\n",
-                 static_cast<long long>(atom.Z.get()), 0.0, atom.x, atom.y,
-                 atom.z);
+  for( const auto& atom : mol ) {
+    std::fprintf( f, "%5lld %12.6f %12.6f %12.6f %12.6f\n",
+      static_cast<long long>(atom.Z.get()), 0.0, atom.x, atom.y, atom.z );
   }
 
   // --- Data block ---
-  // Each (ix, iy) row is grid.nz values, six per line, %13.5E. The cube
-  // format requires a newline at the end of every (ix, iy) row regardless
-  // of how many values land on the last line. Rows are independent, so we
-  // format them in parallel into a pre-sized buffer and commit with a
-  // single fwrite.
+  // Each (ix, iy) row is grid.nz values, six per line, %13.5E. The cube format
+  // requires a newline at the end of every row regardless of how many values
+  // land on the last line, so a row occupies exactly nz*13 + ceil(nz/6) bytes.
+  // Rows are therefore equally sized and independent: a chunk of rows is
+  // formatted in parallel at known offsets and committed with a single fwrite,
+  // with no compaction pass and a staging buffer that stays bounded regardless
+  // of grid size.
   const int64_t nz = grid.nz;
-  const int64_t lines_per_row = (nz + 5) / 6;
-  // Worst case 6*13 + 1 = 79 bytes per line; over-allocates the trailing
-  // line of each row but avoids a precise sizing pass.
-  const int64_t bytes_per_row = lines_per_row * (6 * 13 + 1);
+  const int64_t bytes_per_row = nz * 13 + (nz + 5) / 6;
   const int64_t n_rows = grid.nx * grid.ny;
-  std::vector<char> buf(static_cast<size_t>(bytes_per_row * n_rows));
-  std::vector<int64_t> row_byte_count(static_cast<size_t>(n_rows), 0);
+
+  // 8 MiB is well past the point where sequential fwrite stops caring about
+  // block size, and keeps the staging buffer small enough to stay cache- and
+  // NUMA-friendly on large grids.
+  constexpr int64_t target_chunk_bytes = 8ll * 1024 * 1024;
+  const int64_t rows_per_chunk =
+    std::clamp<int64_t>( target_chunk_bytes / bytes_per_row, 1, n_rows );
+  std::vector<char> buf( static_cast<size_t>(rows_per_chunk * bytes_per_row) );
+
+  for( int64_t r0 = 0; r0 < n_rows; r0 += rows_per_chunk ) {
+
+    const int64_t nr = std::min( rows_per_chunk, n_rows - r0 );
 
 #pragma omp parallel for schedule(static)
-  for (int64_t row = 0; row < n_rows; ++row) {
-    const double* row_data =
-        field + static_cast<size_t>(row) * static_cast<size_t>(nz);
-    char* dst = buf.data() + static_cast<size_t>(row) *
-                                 static_cast<size_t>(bytes_per_row);
-    int64_t off = 0;
-    for (int64_t iz = 0; iz < nz; ++iz) {
-      format_e13_5(row_data[iz], dst + off);
-      off += 13;
-      // Every 6 values OR at the end of the row → newline.
-      if (((iz + 1) % 6 == 0) || (iz + 1 == nz)) {
-        dst[off++] = '\n';
+    for( int64_t r = 0; r < nr; ++r ) {
+      const double* row_data =
+        field + static_cast<size_t>(r0 + r) * static_cast<size_t>(nz);
+      char* dst =
+        buf.data() + static_cast<size_t>(r) * static_cast<size_t>(bytes_per_row);
+      int64_t off = 0;
+      for( int64_t iz = 0; iz < nz; ++iz ) {
+        format_e13_5( row_data[iz], dst + off );
+        off += 13;
+        // Every 6 values OR at the end of the row -> newline.
+        if( (iz + 1) % 6 == 0 or iz + 1 == nz ) dst[off++] = '\n';
       }
     }
-    row_byte_count[static_cast<size_t>(row)] = off;
-  }
 
-  // Compact rows in place (worst-case padding between them) and emit
-  // with a single fwrite.
-  if (n_rows > 1) {
-    int64_t write_off = row_byte_count[0];
-    for (int64_t row = 1; row < n_rows; ++row) {
-      const int64_t src_off = row * bytes_per_row;
-      const int64_t len = row_byte_count[static_cast<size_t>(row)];
-      std::memmove(buf.data() + write_off, buf.data() + src_off,
-                   static_cast<size_t>(len));
-      write_off += len;
-    }
-    if (std::fwrite(buf.data(), 1, static_cast<size_t>(write_off), f) !=
-        static_cast<size_t>(write_off)) {
-      std::fclose(f);
+    const size_t nbytes = static_cast<size_t>( nr * bytes_per_row );
+    if( std::fwrite( buf.data(), 1, nbytes, f ) != nbytes ) {
       GAUXC_GENERIC_EXCEPTION("write_cube: short write to " + path);
     }
-  } else {
-    if (std::fwrite(buf.data(), 1, static_cast<size_t>(row_byte_count[0]),
-                    f) != static_cast<size_t>(row_byte_count[0])) {
-      std::fclose(f);
-      GAUXC_GENERIC_EXCEPTION("write_cube: short write to " + path);
-    }
+
   }
 
-  if (std::fclose(f) != 0) {
+  if( std::fclose( fh.release() ) != 0 ) {
     GAUXC_GENERIC_EXCEPTION("write_cube: failed to close " + path);
   }
+
 }
 
 }  // namespace GauXC

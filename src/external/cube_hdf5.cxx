@@ -3,7 +3,7 @@
  * through Lawrence Berkeley National Laboratory (subject to receipt of
  * any required approvals from the U.S. Dept. of Energy).
  *
- * (c) 2024-2026, Microsoft Corporation
+ * (c) 2024-2025, Microsoft Corporation
  *
  * All rights reserved.
  *
@@ -21,15 +21,15 @@
 
 namespace GauXC {
 
-void write_cube_hdf5(const std::string& path,
-                     const Molecule& mol,
-                     const CubeGrid& grid,
-                     const double* field,
-                     const std::string& comment) {
-  if (grid.num_points() <= 0) {
+void write_cube_hdf5( const std::string& path,
+                      const Molecule& mol,
+                      const CubeGrid& grid,
+                      const double* field,
+                      const std::string& comment ) {
+  if( grid.num_points() <= 0 ) {
     GAUXC_GENERIC_EXCEPTION("write_cube_hdf5: grid has zero points.");
   }
-  if (field == nullptr) {
+  if( not field ) {
     GAUXC_GENERIC_EXCEPTION("write_cube_hdf5: null field pointer.");
   }
 
@@ -64,7 +64,7 @@ void write_cube_hdf5(const std::string& path,
 
   std::vector<int64_t> atomic_numbers(natom);
   std::vector<double> coords(natom * 3);
-  for (size_t i = 0; i < natom; ++i) {
+  for( size_t i = 0; i < natom; ++i ) {
     atomic_numbers[i] = static_cast<int64_t>(mol[i].Z.get());
     coords[3 * i + 0] = mol[i].x;
     coords[3 * i + 1] = mol[i].y;
