@@ -43,6 +43,13 @@ namespace detail {
  *  thread count, so results are bit-reproducible for a fixed thread count but
  *  may differ between thread counts by at most the basis-set shell tolerance.
  *
+ *  Screening cost is governed by the shell tolerance, which the evaluator
+ *  applies to its own private copy of the basis, so the caller's basis (and
+ *  any SCF setup sharing it) is left untouched. Orbital error tracks the
+ *  tolerance directly, density error goes as its square, so density tolerates
+ *  a looser setting for the same accuracy: on a 110-atom system 1e-6 instead
+ *  of the 1e-10 default runs ~2.5x faster on density.
+ *
  *  Instances are produced by OrbitalEvaluatorFactory, which selects the
  *  implementation for a given ExecutionSpace.
  */
@@ -149,9 +156,15 @@ public:
    *                  Currently only ExecutionSpace::Host is implemented;
    *                  anything else throws.
    * @param[in] basis Basis set (copied into the evaluator).
+   * @param[in] screening_tolerance Shell tolerance applied to the evaluator's
+   *                  own copy of `basis`, which sets the cutoff radii used
+   *                  for per-batch screening. A basis carried in from an SCF
+   *                  setup may be far tighter than cube-file precision needs
+   *                  and costs several-fold here for no benefit.
    */
   static OrbitalEvaluator make_orbital_evaluator( ExecutionSpace ex,
-                                                  BasisSet<double> basis );
+    BasisSet<double> basis,
+    double screening_tolerance = detail::default_shell_tolerance );
 
 }; // class OrbitalEvaluatorFactory
 

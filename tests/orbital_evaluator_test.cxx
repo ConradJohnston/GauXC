@@ -52,9 +52,9 @@ std::string make_temp_path(const char* suffix) {
          std::to_string(++counter) + suffix;
 }
 
-OrbitalEvaluator make_evaluator(const BasisSet<double>& basis) {
+OrbitalEvaluator make_evaluator(const BasisSet<double>& basis, double tol) {
   return OrbitalEvaluatorFactory::make_orbital_evaluator(ExecutionSpace::Host,
-                                                         basis);
+                                                         basis, tol);
 }
 
 /// AO collocation over every shell, i.e. the unscreened reference.
@@ -116,7 +116,7 @@ TEST_CASE("OrbitalEvaluator / Water cc-pVDZ matches eval_collocation",
   // Reference: AO collocation directly via the LocalHostWorkDriver.
   const auto ao_ref = reference_collocation(basis, npts, pts.data());
 
-  auto eval = make_evaluator(basis);
+  auto eval = make_evaluator(basis, 1e-12);
   REQUIRE(eval.nbf() == nbf);
 
   SECTION("eval_orbital with one-hot coefficient reproduces single AO column") {
@@ -217,7 +217,7 @@ TEST_CASE("CubeGrid eval overloads match pointer-based eval",
   auto basis = make_ccpvdz(mol, SphericalType(true));
   for (auto& sh : basis) sh.set_shell_tolerance(1e-12);
   const int32_t nbf = basis.nbf();
-  auto eval = make_evaluator(basis);
+  auto eval = make_evaluator(basis, 1e-12);
 
   // 6x7x8 fits in a single batch; 20x20x20 = 8000 points spreads over many
   // batches at any thread count, exercising the trailing partial batch and
@@ -275,9 +275,10 @@ TEST_CASE("OrbitalEvaluator shell screening", "[orbital_evaluator]") {
   mol.emplace_back(AtomicNumber(1), 20.0, 0.0, 0.0);
 
   auto basis = make_ccpvdz(mol, SphericalType(true));
-  for (auto& sh : basis) sh.set_shell_tolerance(1e-10);
+  constexpr double shell_tol = 1e-10;
+  for (auto& sh : basis) sh.set_shell_tolerance(shell_tol);
   const int32_t nbf = basis.nbf();
-  auto eval = make_evaluator(basis);
+  auto eval = make_evaluator(basis, shell_tol);
 
   const auto C = make_random_vector(static_cast<size_t>(nbf), 2024u);
   std::vector<double> D(static_cast<size_t>(nbf) * nbf, 0.0);
@@ -319,9 +320,9 @@ TEST_CASE("OrbitalEvaluator shell screening", "[orbital_evaluator]") {
     std::vector<double> rho(static_cast<size_t>(npts));
     eval.eval_density(grid, D.data(), nbf, rho.data());
 
-    // The grid overload screens against an analytically derived batch bbox
-    // while the pointer overload scans the coordinates; with screening active
-    // the two must still agree exactly.
+    // The grid overload walks spatial tiles while the pointer overload takes
+    // contiguous index ranges, so the two screen against different bounding
+    // boxes. They agree to within the shell tolerance, not bitwise.
     std::vector<double> orb_pts(static_cast<size_t>(npts));
     eval.eval_orbital(npts, pts.data(), C.data(), orb_pts.data());
     std::vector<double> rho_pts(static_cast<size_t>(npts));
@@ -329,8 +330,8 @@ TEST_CASE("OrbitalEvaluator shell screening", "[orbital_evaluator]") {
 
     bool any_nonzero = false;
     for (int64_t p = 0; p < npts; ++p) {
-      CHECK(orb[p] == orb_pts[p]);
-      CHECK(rho[p] == rho_pts[p]);
+      CHECK(orb[p] == Approx(orb_pts[p]).margin(shell_tol));
+      CHECK(rho[p] == Approx(rho_pts[p]).margin(shell_tol));
 
       double orb_ref = 0.0, rho_ref = 0.0;
       for (int32_t mu = 0; mu < nbf; ++mu) {
@@ -348,14 +349,16 @@ TEST_CASE("OrbitalEvaluator shell screening", "[orbital_evaluator]") {
   }
 }
 
-TEST_CASE("OrbitalEvaluator is invariant to the OpenMP thread count",
+TEST_CASE("OrbitalEvaluator survives a thread-count change after construction",
           "[orbital_evaluator]") {
-  // Bit-exact here because the grid encloses the molecule at a 1e-12 shell
-  // tolerance, so nothing screens and the batch decomposition cannot change
-  // the arithmetic. The screened case is covered separately below.
+  // Regression guard: scratch must follow the thread count in force at
+  // evaluation time, not at construction. Batch shape is derived from the
+  // thread count, so the two runs screen slightly differently and agree to
+  // within the shell tolerance rather than bitwise.
   auto mol = make_water();
   auto basis = make_ccpvdz(mol, SphericalType(true));
-  for (auto& sh : basis) sh.set_shell_tolerance(1e-12);
+  constexpr double shell_tol = 1e-12;
+  for (auto& sh : basis) sh.set_shell_tolerance(shell_tol);
   const int32_t nbf = basis.nbf();
 
   auto grid = CubeGrid::from_molecule(mol, 16, 16, 16);
@@ -371,7 +374,7 @@ TEST_CASE("OrbitalEvaluator is invariant to the OpenMP thread count",
   // must follow the thread count in force at evaluation time.
   omp_set_num_threads(1);
 #endif
-  auto eval = make_evaluator(basis);
+  auto eval = make_evaluator(basis, shell_tol);
 
   std::vector<double> orb_serial(static_cast<size_t>(npts));
   std::vector<double> rho_serial(static_cast<size_t>(npts));
@@ -392,8 +395,8 @@ TEST_CASE("OrbitalEvaluator is invariant to the OpenMP thread count",
 #endif
 
   for (int64_t p = 0; p < npts; ++p) {
-    CHECK(orb_par[p] == orb_serial[p]);
-    CHECK(rho_par[p] == rho_serial[p]);
+    CHECK(orb_par[p] == Approx(orb_serial[p]).margin(shell_tol));
+    CHECK(rho_par[p] == Approx(rho_serial[p]).margin(shell_tol));
   }
 }
 
@@ -410,7 +413,7 @@ TEST_CASE("OrbitalEvaluator thread-count dependence is bounded by screening",
   constexpr double shell_tol = 1e-10;
   for (auto& sh : basis) sh.set_shell_tolerance(shell_tol);
   const int32_t nbf = basis.nbf();
-  auto eval = make_evaluator(basis);
+  auto eval = make_evaluator(basis, shell_tol);
 
   CubeGrid grid;
   grid.origin = {-4.0, -4.0, -4.0};
@@ -442,6 +445,61 @@ TEST_CASE("OrbitalEvaluator thread-count dependence is bounded by screening",
   for (int64_t p = 0; p < npts; ++p) {
     CHECK(rho_par[p] == Approx(rho_serial[p]).margin(shell_tol));
   }
+}
+
+TEST_CASE("OrbitalEvaluator screening error scales with the shell tolerance",
+          "[orbital_evaluator]") {
+  // Pins the guidance on the class: orbital error is bounded by the shell
+  // tolerance, density error by its square, since dropping a shell with
+  // |phi| < t perturbs sum_uv D phi phi by ~t^2.
+  Molecule mol;
+  mol.emplace_back(AtomicNumber(8), 0.0, 0.0, 0.0);
+  mol.emplace_back(AtomicNumber(1), 20.0, 0.0, 0.0);
+
+  constexpr double loose_tol = 1e-6;
+  auto basis = make_ccpvdz(mol, SphericalType(true));
+  const int32_t nbf = basis.nbf();
+
+  std::vector<double> radii_before;
+  for (const auto& sh : basis) radii_before.push_back(sh.cutoff_radius());
+
+  auto eval_tight = make_evaluator(basis, 1e-14);
+  auto eval_loose = make_evaluator(basis, loose_tol);
+
+  // Retuning happens on each evaluator's own copy; a basis shared with an SCF
+  // setup must come back unchanged.
+  for (size_t i = 0; i < basis.size(); ++i)
+    CHECK(basis[i].cutoff_radius() == radii_before[i]);
+
+  CubeGrid grid;
+  grid.origin = {-4.0, -4.0, -4.0};
+  grid.spacing = {0.8, 2.0, 2.0};
+  grid.nx = 40;
+  grid.ny = 4;
+  grid.nz = 4;
+  const int64_t npts = grid.num_points();
+
+  const auto C = make_random_vector(static_cast<size_t>(nbf), 31337u);
+  std::vector<double> D(static_cast<size_t>(nbf) * nbf, 0.0);
+  for (int32_t i = 0; i < nbf; ++i) D[i * nbf + i] = 1.0;
+
+  std::vector<double> orb_tight(npts), orb_loose(npts);
+  std::vector<double> rho_tight(npts), rho_loose(npts);
+  eval_tight.eval_orbital(grid, C.data(), orb_tight.data());
+  eval_loose.eval_orbital(grid, C.data(), orb_loose.data());
+  eval_tight.eval_density(grid, D.data(), nbf, rho_tight.data());
+  eval_loose.eval_density(grid, D.data(), nbf, rho_loose.data());
+
+  double orb_err = 0.0, rho_err = 0.0;
+  for (int64_t p = 0; p < npts; ++p) {
+    orb_err = std::max(orb_err, std::fabs(orb_loose[p] - orb_tight[p]));
+    rho_err = std::max(rho_err, std::fabs(rho_loose[p] - rho_tight[p]));
+  }
+
+  INFO("orbital error " << orb_err << ", density error " << rho_err);
+  CHECK(orb_err > 0.0);  // screening is genuinely active at the loose tolerance
+  CHECK(orb_err <= 10.0 * loose_tol);
+  CHECK(rho_err <= 100.0 * loose_tol * loose_tol);
 }
 
 TEST_CASE("CubeGrid construction and grid-points layout", "[cube]") {

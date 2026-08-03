@@ -35,7 +35,7 @@ public:
   std::vector<double> shell_cutoff_r2;        ///< Per-shell squared cutoff radius
   int32_t nbf_ = 0;
 
-  OrbitalEvaluatorImpl( BasisSet<double> bs );
+  OrbitalEvaluatorImpl( BasisSet<double> bs, double screening_tolerance );
 
 }; // class OrbitalEvaluatorImpl
 
