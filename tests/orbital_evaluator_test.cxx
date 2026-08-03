@@ -12,6 +12,7 @@
 #include "ut_common.hpp"
 #include "catch2/catch.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <fstream>
@@ -407,6 +408,91 @@ TEST_CASE("OrbitalEvaluator tiled grid traversal matches the reference",
     CHECK(rho[p] == Approx(rho_pts[p]).margin(shell_tol));
   }
   CHECK(any_nonzero);
+}
+
+TEST_CASE("OrbitalEvaluator screens a batch lying inside one grid row",
+          "[orbital_evaluator]") {
+  // With iz fastest, a contiguous batch shorter than one row is boxed by its
+  // own z sub-range rather than the whole axis. Three things have to line up
+  // for that box to matter. The row must outlast a batch, so nz exceeds the
+  // batch size. The grid must stay off the tiled path, so the z extent sits
+  // inside the tiling threshold of twice the median cutoff radius, derived
+  // here from the basis rather than hard-coded. And the molecule must sit at
+  // the far end of z, so that shrinking the box moves the face nearest the
+  // shells and changes what survives screening.
+  auto mol = make_water();
+
+  constexpr double shell_tol = 1e-10;
+  auto basis = make_ccpvdz(mol, SphericalType(true));
+  for (auto& sh : basis) sh.set_shell_tolerance(shell_tol);
+  const int32_t nbf = basis.nbf();
+
+  std::vector<double> radii;
+  radii.reserve(basis.size());
+  for (const auto& sh : basis) radii.push_back(sh.cutoff_radius());
+  const size_t mid = radii.size() / 2;
+  std::nth_element(radii.begin(), radii.begin() + mid, radii.end());
+  const double median_radius = radii[mid];
+
+  const double z_extent = 1.8 * median_radius;
+
+  CubeGrid grid;
+  grid.nx = 1;
+  grid.ny = 3;
+  grid.nz = 3000;
+  grid.spacing = {1.0, 1.0, z_extent / static_cast<double>(grid.nz)};
+  // Offset in x so no point lands on a nucleus; the row runs from z_extent
+  // below the molecule up to 1 Bohr short of it.
+  grid.origin = {0.3, 0.0, -(z_extent + 1.0)};
+
+  const int64_t npts = grid.num_points();
+  const auto pts = grid.points();
+  const auto ao_ref = reference_collocation(basis, npts, pts.data());
+
+  const auto C = make_random_vector(static_cast<size_t>(nbf), 4099u);
+  std::vector<double> D(static_cast<size_t>(nbf) * nbf, 0.0);
+  for (int32_t i = 0; i < nbf; ++i) D[i * nbf + i] = 1.0;
+
+  std::vector<double> orb(static_cast<size_t>(npts));
+  std::vector<double> rho(static_cast<size_t>(npts));
+  std::vector<double> orb_pts(static_cast<size_t>(npts));
+  std::vector<double> rho_pts(static_cast<size_t>(npts));
+
+#ifdef _OPENMP
+  const int saved_threads = omp_get_max_threads();
+  // Serial so the batch is npts/4 rather than thread-count dependent, which
+  // puts three quarters of a row in one batch on any machine.
+  omp_set_num_threads(1);
+#endif
+  auto eval = make_evaluator(basis, shell_tol);
+  eval.eval_orbital(grid, C.data(), orb.data());
+  eval.eval_density(grid, D.data(), nbf, rho.data());
+  // The pointer overload boxes the points it is handed instead of deriving a
+  // box from grid indices, so it checks the index arithmetic independently.
+  eval.eval_orbital(npts, pts.data(), C.data(), orb_pts.data());
+  eval.eval_density(npts, pts.data(), D.data(), nbf, rho_pts.data());
+#ifdef _OPENMP
+  omp_set_num_threads(saved_threads);
+#endif
+
+  for (int64_t p = 0; p < npts; ++p) {
+    double orb_ref = 0.0, rho_ref = 0.0;
+    for (int32_t mu = 0; mu < nbf; ++mu) {
+      const double a = ao_ref[static_cast<size_t>(p) * nbf + mu];
+      orb_ref += C[static_cast<size_t>(mu)] * a;
+      rho_ref += a * a;
+    }
+    CHECK(orb[p] == Approx(orb_ref).margin(1e-9));
+    CHECK(rho[p] == Approx(rho_ref).margin(1e-9));
+    CHECK(orb[p] == Approx(orb_pts[p]).margin(shell_tol));
+    CHECK(rho[p] == Approx(rho_pts[p]).margin(shell_tol));
+  }
+
+  // Pins the span the batch box is being asked to resolve: the row ends on
+  // the molecule and starts far enough away for shells to have died off.
+  const size_t row_end = static_cast<size_t>(grid.nz) - 1;
+  CHECK(rho[row_end] > 1e-2);
+  CHECK(rho[0] < 1e-4 * rho[row_end]);
 }
 
 TEST_CASE("OrbitalEvaluator survives a thread-count change after construction",
