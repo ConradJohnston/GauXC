@@ -349,6 +349,66 @@ TEST_CASE("OrbitalEvaluator shell screening", "[orbital_evaluator]") {
   }
 }
 
+TEST_CASE("OrbitalEvaluator tiled grid traversal matches the reference",
+          "[orbital_evaluator]") {
+  // Grids spanning well beyond a cutoff radius along z are walked in spatial
+  // tiles rather than contiguous index ranges. The 32 Bohr z extent here is
+  // several times the largest cc-pVDZ cutoff radius (13.2 Bohr), so the tiled
+  // path stays selected; the two centres are far enough apart that screening
+  // is active within it.
+  Molecule mol;
+  mol.emplace_back(AtomicNumber(8), 0.0, 0.0, 0.0);
+  mol.emplace_back(AtomicNumber(1), 0.0, 0.0, 20.0);
+
+  constexpr double shell_tol = 1e-10;
+  auto basis = make_ccpvdz(mol, SphericalType(true));
+  for (auto& sh : basis) sh.set_shell_tolerance(shell_tol);
+  const int32_t nbf = basis.nbf();
+  auto eval = make_evaluator(basis, shell_tol);
+
+  CubeGrid grid;
+  grid.origin = {-4.0, -4.0, -6.0};
+  grid.spacing = {2.0, 2.0, 0.8};
+  grid.nx = 4;
+  grid.ny = 4;
+  grid.nz = 40;
+  const int64_t npts = grid.num_points();
+  const auto pts = grid.points();
+  const auto ao_ref = reference_collocation(basis, npts, pts.data());
+
+  const auto C = make_random_vector(static_cast<size_t>(nbf), 8675u);
+  std::vector<double> D(static_cast<size_t>(nbf) * nbf, 0.0);
+  for (int32_t i = 0; i < nbf; ++i) D[i * nbf + i] = 1.0;
+
+  std::vector<double> orb(static_cast<size_t>(npts));
+  std::vector<double> rho(static_cast<size_t>(npts));
+  eval.eval_orbital(grid, C.data(), orb.data());
+  eval.eval_density(grid, D.data(), nbf, rho.data());
+
+  // The pointer overload always uses contiguous batches, so it cross-checks
+  // the tiled result against a different decomposition.
+  std::vector<double> orb_pts(static_cast<size_t>(npts));
+  std::vector<double> rho_pts(static_cast<size_t>(npts));
+  eval.eval_orbital(npts, pts.data(), C.data(), orb_pts.data());
+  eval.eval_density(npts, pts.data(), D.data(), nbf, rho_pts.data());
+
+  bool any_nonzero = false;
+  for (int64_t p = 0; p < npts; ++p) {
+    double orb_ref = 0.0, rho_ref = 0.0;
+    for (int32_t mu = 0; mu < nbf; ++mu) {
+      const double a = ao_ref[static_cast<size_t>(p) * nbf + mu];
+      orb_ref += C[static_cast<size_t>(mu)] * a;
+      rho_ref += a * a;
+    }
+    if (std::fabs(orb_ref) > 1e-3) any_nonzero = true;
+    CHECK(orb[p] == Approx(orb_ref).margin(1e-9));
+    CHECK(rho[p] == Approx(rho_ref).margin(1e-9));
+    CHECK(orb[p] == Approx(orb_pts[p]).margin(shell_tol));
+    CHECK(rho[p] == Approx(rho_pts[p]).margin(shell_tol));
+  }
+  CHECK(any_nonzero);
+}
+
 TEST_CASE("OrbitalEvaluator survives a thread-count change after construction",
           "[orbital_evaluator]") {
   // Regression guard: scratch must follow the thread count in force at
