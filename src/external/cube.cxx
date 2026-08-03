@@ -27,12 +27,12 @@ namespace {
 
 /** @brief Format `v` as a fixed 13-character "%13.5E" field.
  *
- *  Layout: sign + D + '.' + 5 digits + 'E' + sign + 2 digits. snprintf in
- *  the inner loop dominates write time on large grids; this reproduces glibc
- *  "%13.5E" for every value except exact half-way ties in the 6th significant
- *  digit, where glibc rounds the exact binary value half-to-even while this
- *  routine rounds half-away-from-zero. Both agree to within one unit of the
- *  last printed digit. 3-digit exponents defer to snprintf.
+ *  Layout: sign + D + '.' + 5 digits + 'E' + sign + 2 digits. snprintf in the
+ *  inner loop dominates write time on large grids. This matches glibc
+ *  "%13.5E" except for values lying within a few ulp of a rounding boundary
+ *  in the 6th significant digit, where scaling the mantissa by pow(10,-exp10)
+ *  can tip it across the boundary; the two then differ by one unit in the last
+ *  printed digit. Values needing a 3-digit exponent defer to snprintf.
  *
  *  @param[in]  v   Value to format.
  *  @param[out] out Exactly 13 bytes are written (no trailing NUL).
@@ -57,36 +57,29 @@ inline void format_e13_5( double v, char* out ) {
     return;
   }
 
-  // Exponent via floor(log10), with corrections for FP edge cases
-  // (e.g. 9.99999 rounding up across a power-of-ten boundary).
   int exp10 = static_cast<int>( std::floor( std::log10(absv) ) );
-  double scale = std::pow( 10.0, -exp10 );
-  double mant = absv * scale;
 
-  long long mant_int = std::llround( mant * 1e5 );
-  if( mant_int >= 1000000 ) {
-    mant_int = 100000;
-    ++exp10;
-  } else if( mant_int < 100000 ) {
-    --exp10;
-    scale = std::pow( 10.0, -exp10 );
-    mant = absv * scale;
+  // Tested before scaling: pow(10,-exp10) overflows for subnormal inputs.
+  bool wide_exponent = ( exp10 > 99 or exp10 < -99 );
+
+  long long mant_int = 0;
+  if( not wide_exponent ) {
+    const double mant = absv * std::pow( 10.0, -exp10 );
+    // Over this range pow() is accurate to a few ulp, so mant cannot fall
+    // below 1 and only the carry out of 9.999995 needs correcting.
     mant_int = std::llround( mant * 1e5 );
-    if( mant_int >= 1000000 )     mant_int = 999999;
-    else if( mant_int < 100000 )  mant_int = 100000;
+    if( mant_int >= 1000000 ) {
+      mant_int = 100000;
+      wide_exponent = ( ++exp10 > 99 );
+    }
   }
 
-  // 3+ digit exponents have a different field layout; defer to snprintf.
-  if( exp10 > 99 or exp10 < -99 ) {
+  // 3-digit exponents have a different field layout; defer to snprintf.
+  if( wide_exponent ) {
     char tmp[32];
+    // "%13.5E" sets a minimum field width of 13, so n is never below 13.
     const int n = std::snprintf( tmp, sizeof(tmp), "%13.5E", v );
-    if( n >= 13 ) {
-      std::memcpy( out, tmp + (n - 13), 13 );
-    } else {
-      const int pad = 13 - n;
-      for( int i = 0; i < pad; ++i ) out[i] = ' ';
-      std::memcpy( out + pad, tmp, static_cast<size_t>(n) );
-    }
+    std::memcpy( out, tmp + (n - 13), 13 );
     return;
   }
 

@@ -748,11 +748,30 @@ TEST_CASE("write_cube agrees with snprintf %13.5E formatting", "[cube]") {
 
   const double qnan = std::numeric_limits<double>::quiet_NaN();
   const double inf = std::numeric_limits<double>::infinity();
-  std::vector<double> field = {0.0,      -0.0,     1.23456e-10, -9.99995e-1,
-                               1.0e+99,  -1.0e+99, 3.14159265358979,
-                               -2.71828, 1.0,      -1.0,        1e-300,
-                               1.234e+05, qnan,    -qnan,       inf,
-                               -inf};
+  // The last five exercise the snprintf deferral: subnormals (where scaling
+  // the mantissa would overflow), a 3-digit exponent either side of zero, and
+  // a mantissa that carries from E+99 up into a 3-digit exponent.
+  std::vector<double> field = {0.0,
+                               -0.0,
+                               1.23456e-10,
+                               -9.99995e-1,
+                               1.0e+99,
+                               -1.0e+99,
+                               3.14159265358979,
+                               -2.71828,
+                               1.0,
+                               -1.0,
+                               1e-300,
+                               1.234e+05,
+                               qnan,
+                               -qnan,
+                               inf,
+                               -inf,
+                               std::numeric_limits<double>::denorm_min(),
+                               -1e-310,
+                               1.0e+300,
+                               -1.0e-305,
+                               9.9999999e+99};
 
   const std::string data_block = cube_data_block(mol, field);
 
@@ -821,17 +840,18 @@ TEST_CASE("write_cube spans multiple output chunks", "[cube]") {
   std::remove(path.c_str());
 }
 
-TEST_CASE("write_cube formatter rounds half-way ties within one last digit",
+TEST_CASE("write_cube formatter stays within one last digit at a rounding "
+          "boundary",
           "[cube]") {
 #ifdef GAUXC_HAS_MPI
   int world_rank;
   MPI_Comm_rank(MPI_COMM_WORLD, &world_rank);
   if (world_rank) return;  // File I/O; only run on root rank
 #endif
-  // The hand-rolled formatter rounds exact half-way ties in the 6th
-  // significant digit half-away-from-zero, whereas glibc rounds the exact
-  // binary value half-to-even. Both are within one unit of the last printed
-  // digit; this pins that bound rather than byte equality.
+  // For values sitting within a few ulp of a rounding boundary in the 6th
+  // significant digit, scaling the mantissa can tip it across the boundary,
+  // so the formatter and glibc may pick different last digits. Both stay
+  // within one unit of it; this pins that bound rather than byte equality.
   auto mol = make_water();
   const std::vector<double> field = {123456.5, 1.234575, -123456.5, -1.234575,
                                      9.9999949999999998642e-98, 0.0};
