@@ -212,6 +212,108 @@ TEST_CASE("OrbitalEvaluator / Water cc-pVDZ matches eval_collocation",
   }
 }
 
+TEST_CASE("OrbitalEvaluator public API surface", "[orbital_evaluator]") {
+  auto mol = make_water();
+  constexpr double shell_tol = 1e-10;
+  auto basis = make_ccpvdz(mol, SphericalType(true));
+  for (auto& sh : basis) sh.set_shell_tolerance(shell_tol);
+  const int32_t nbf = basis.nbf();
+
+  SECTION("basis() exposes the evaluator's own retuned copy") {
+    auto tight = make_ccpvdz(mol, SphericalType(true));
+    for (auto& sh : tight) sh.set_shell_tolerance(1e-12);
+    auto eval = make_evaluator(tight, 1e-4);
+
+    REQUIRE(eval.basis().nbf() == nbf);
+    REQUIRE(eval.basis().size() == tight.size());
+
+    // The caller's basis keeps the tolerance it was given, so the evaluator's
+    // looser one must show up as shorter cutoff radii on its copy alone.
+    bool any_shorter = false;
+    for (size_t i = 0; i < tight.size(); ++i) {
+      CHECK(eval.basis()[i].cutoff_radius() <= tight[i].cutoff_radius());
+      if (eval.basis()[i].cutoff_radius() < tight[i].cutoff_radius())
+        any_shorter = true;
+    }
+    CHECK(any_shorter);
+  }
+
+  SECTION("move construction and assignment carry the implementation") {
+    const int64_t npts = 64;
+    const auto pts = make_random_points(npts, 7u);
+    const auto C = make_random_vector(static_cast<size_t>(nbf), 11u);
+
+    auto eval = make_evaluator(basis, shell_tol);
+    std::vector<double> ref(static_cast<size_t>(npts));
+    eval.eval_orbital(npts, pts.data(), C.data(), ref.data());
+
+    OrbitalEvaluator moved(std::move(eval));
+    REQUIRE(moved.nbf() == nbf);
+    std::vector<double> out(static_cast<size_t>(npts));
+    moved.eval_orbital(npts, pts.data(), C.data(), out.data());
+    for (int64_t p = 0; p < npts; ++p) CHECK(out[p] == ref[p]);
+
+    // Assigned over an evaluator built with a looser tolerance, so the result
+    // would shift if the target's original implementation survived.
+    auto target = make_evaluator(basis, 1e-3);
+    target = std::move(moved);
+    REQUIRE(target.nbf() == nbf);
+    std::vector<double> out2(static_cast<size_t>(npts));
+    target.eval_orbital(npts, pts.data(), C.data(), out2.data());
+    for (int64_t p = 0; p < npts; ++p) CHECK(out2[p] == ref[p]);
+  }
+
+  SECTION("a non-Host execution space is rejected") {
+    CHECK_THROWS(OrbitalEvaluatorFactory::make_orbital_evaluator(
+        ExecutionSpace::Device, basis));
+  }
+
+  SECTION("null pointers and undersized leading dimensions throw") {
+    auto eval = make_evaluator(basis, shell_tol);
+    const int64_t npts = 8;
+    const auto pts = make_random_points(npts, 3u);
+    std::vector<double> C(static_cast<size_t>(nbf), 1.0);
+    std::vector<double> out(static_cast<size_t>(npts), 0.0);
+    std::vector<double> D(static_cast<size_t>(nbf) * nbf, 0.0);
+
+    CHECK_THROWS(eval.eval_orbital(npts, nullptr, C.data(), out.data()));
+    CHECK_THROWS(eval.eval_orbital(npts, pts.data(), nullptr, out.data()));
+    CHECK_THROWS(eval.eval_orbital(npts, pts.data(), C.data(), nullptr));
+    CHECK_THROWS(eval.eval_density(npts, nullptr, D.data(), nbf, out.data()));
+    CHECK_THROWS(eval.eval_density(npts, pts.data(), nullptr, nbf, out.data()));
+    CHECK_THROWS(eval.eval_density(npts, pts.data(), D.data(), nbf, nullptr));
+    CHECK_THROWS(
+        eval.eval_density(npts, pts.data(), D.data(), nbf - 1, out.data()));
+
+    const auto grid = CubeGrid::from_molecule(mol, 3, 3, 3);
+    std::vector<double> gout(static_cast<size_t>(grid.num_points()), 0.0);
+    CHECK_THROWS(eval.eval_orbital(grid, nullptr, gout.data()));
+    CHECK_THROWS(eval.eval_density(grid, D.data(), nbf - 1, gout.data()));
+  }
+
+  SECTION("empty work is a no-op rather than an error") {
+    auto eval = make_evaluator(basis, shell_tol);
+    std::vector<double> C(static_cast<size_t>(nbf), 1.0);
+    std::vector<double> D(static_cast<size_t>(nbf) * nbf, 0.0);
+    constexpr double untouched = -7.0;
+    std::vector<double> out(4, untouched);
+    const auto pts = make_random_points(4, 5u);
+
+    CHECK_NOTHROW(
+        eval.eval_orbitals(0, nullptr, 1, C.data(), nbf, out.data(), 0));
+    CHECK_NOTHROW(eval.eval_density(0, nullptr, D.data(), nbf, out.data()));
+    CHECK_NOTHROW(
+        eval.eval_orbitals(4, pts.data(), 0, C.data(), nbf, out.data(), 4));
+
+    CubeGrid empty;
+    empty.nx = 0;
+    CHECK_NOTHROW(eval.eval_orbital(empty, C.data(), out.data()));
+    CHECK_NOTHROW(eval.eval_density(empty, D.data(), nbf, out.data()));
+
+    for (double v : out) CHECK(v == untouched);
+  }
+}
+
 TEST_CASE("CubeGrid eval overloads match pointer-based eval",
           "[orbital_evaluator]") {
   auto mol = make_water();
@@ -782,6 +884,58 @@ TEST_CASE("CubeGrid construction and grid-points layout", "[cube]") {
   CHECK(pts[3 * static_cast<size_t>(off_y) + 1] ==
         Approx(g.origin[1] + g.spacing[1]));
   CHECK(pts[3 * 1 + 2] == Approx(g.origin[2] + g.spacing[2]));
+}
+
+TEST_CASE("CubeGrid rejects degenerate specifications", "[cube]") {
+  auto mol = make_water();
+  CHECK_THROWS(CubeGrid::from_molecule(Molecule{}, 4, 4, 4));
+  CHECK_THROWS(CubeGrid::from_molecule(mol, 0, 4, 4));
+  CHECK_THROWS(CubeGrid::from_molecule(mol, 4, 0, 4));
+  CHECK_THROWS(CubeGrid::from_molecule(mol, 4, 4, 0));
+
+  const auto grid = CubeGrid::from_molecule(mol, 3, 4, 5);
+  const auto pts = grid.points();
+  REQUIRE(pts.size() == static_cast<size_t>(grid.num_points()) * 3);
+
+  std::vector<double> buf(pts.size(), -1.0);
+  grid.points_into(buf.data());
+  for (size_t i = 0; i < pts.size(); ++i) CHECK(buf[i] == pts[i]);
+}
+
+TEST_CASE("write_cube rejects bad input and defaults its comment", "[cube]") {
+#ifdef GAUXC_HAS_MPI
+  int world_rank;
+  MPI_Comm_rank(MPI_COMM_WORLD, &world_rank);
+  if (world_rank) return;  // File I/O; only run on root rank
+#endif
+  auto mol = make_water();
+  const auto grid = CubeGrid::from_molecule(mol, 2, 2, 2);
+  std::vector<double> field(static_cast<size_t>(grid.num_points()), 1.0);
+  const auto path = make_temp_path(".cube");
+
+  CHECK_THROWS(write_cube(path, mol, grid, nullptr));
+
+  CubeGrid empty;
+  empty.nx = 0;
+  CHECK_THROWS(write_cube(path, mol, empty, field.data()));
+  CHECK_THROWS(
+      write_cube("/nonexistent-gauxc-dir/out.cube", mol, grid, field.data()));
+
+#ifdef GAUXC_HAS_HDF5
+  const auto h5 = make_temp_path(".h5");
+  CHECK_THROWS(write_cube_hdf5(h5, mol, grid, nullptr));
+  CHECK_THROWS(write_cube_hdf5(h5, mol, empty, field.data()));
+#endif
+
+  // An omitted comment falls back to a fixed first line.
+  write_cube(path, mol, grid, field.data());
+  std::ifstream in(path);
+  REQUIRE(in.good());
+  std::string line;
+  std::getline(in, line);
+  CHECK(line == "GauXC cube file");
+  std::getline(in, line);
+  CHECK(line == "Generated by GauXC");
 }
 
 TEST_CASE("write_cube round-trips header and field data", "[cube]") {
