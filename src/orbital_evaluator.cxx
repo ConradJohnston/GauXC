@@ -384,10 +384,6 @@ public:
                      const double* C, size_t ldc, double* out, size_t ldo ) :
     impl_(impl), nmo_(nmo), C_(C), ldc_(ldc), out_(out), ldo_(ldo) {}
 
-  void init( Scratch& scr ) const {
-    scr.C_compressed.resize( static_cast<size_t>(impl_.nbf_) * nmo_ );
-  }
-
   void zero( const BatchSpan& span ) const {
     for( int32_t j = 0; j < nmo_; ++j ) {
       double* out_col = out_ + static_cast<size_t>(j) * ldo_;
@@ -407,6 +403,9 @@ public:
     // Skipping this when no shell is screened out was measured and is not
     // worth it: that case is 0-5% of batches on anything larger than water,
     // and it is precisely the case where there is nothing to gather.
+    const size_t c_size = static_cast<size_t>(nbe) * nmo_;
+    if( scr.C_compressed.size() < c_size ) scr.C_compressed.resize( c_size );
+
     const BasisSetMap& basis_map = *impl_.basis_map;
     int32_t row = 0;
     for( int32_t ish : shells ) {
@@ -467,8 +466,6 @@ public:
   DensityContractor( const detail::OrbitalEvaluatorImpl& impl, const double* D,
                      size_t ldd, double* out ) :
     impl_(impl), D_(D), ldd_(ldd), out_(out) {}
-
-  void init( Scratch& ) const {}
 
   void zero( const BatchSpan& span ) const {
     for( size_t r = 0; r < span.nruns; ++r )
@@ -546,7 +543,6 @@ void batched_eval( const detail::OrbitalEvaluatorImpl& impl,
     std::vector<int32_t> screened_shells;
     screened_shells.reserve( nshells_total );
     typename Contractor::Scratch scr;
-    contract.init( scr );
 
 #pragma omp for schedule(dynamic, 1)
     for( int64_t b = 0; b < n_batches; ++b ) {
