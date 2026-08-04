@@ -13,6 +13,7 @@
 
 #include <string>
 
+#include <gauxc/gauxc_config.hpp>
 #include <gauxc/cube_grid.hpp>
 #include <gauxc/molecule.hpp>
 
