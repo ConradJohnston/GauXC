@@ -682,6 +682,83 @@ TEST_CASE("OrbitalEvaluator density with a general D and padded ldd",
   CHECK(max_ref > 1e-2);
 }
 
+TEST_CASE("OrbitalEvaluator boxes a multi-row batch out to its far face",
+          "[orbital_evaluator]") {
+  // A batch spanning more than one row is boxed by the whole extent of the
+  // faster axes. Computing that box one grid step short would screen out a
+  // shell sitting on the far face, and those points would lose it entirely.
+  //
+  // One step has to be decisive for this to be visible at all. A shell only
+  // dropped by a one-step shrink lies between cutoff-step and cutoff of the
+  // box, where by construction it contributes about the shell tolerance, so a
+  // fine grid hides the error inside the tolerance it is measured against.
+  // The spacing along the axis under test is therefore set to 1.5x the largest
+  // cutoff radius, measured from the basis rather than assumed, which puts a
+  // shell on the far face either fully in or fully out.
+  constexpr double shell_tol = 1e-10;
+
+  double radius = 0.0;
+  {
+    Molecule probe;
+    probe.emplace_back(AtomicNumber(8), 0.0, 0.0, 0.0);
+    auto pb = make_ccpvdz(probe, SphericalType(true));
+    for (auto& sh : pb) sh.set_shell_tolerance(shell_tol);
+    for (const auto& sh : pb) radius = std::max(radius, sh.cutoff_radius());
+  }
+  REQUIRE(radius > 1.0);
+  const double step = 1.5 * radius;
+
+  // Only the y axis is worth testing this way. Making the z shrink decisive
+  // would need a z spacing above the cutoff radius, and a grid that coarse in
+  // z has a z extent past the tiling threshold, so it takes the tiled path and
+  // never builds this box at all. With nz == 1 the shrunk corner falls below
+  // the low corner and the min/max that follows widens the box instead of
+  // narrowing it. Either way a z shrink here cannot lose a shell.
+  Molecule mol;
+  mol.emplace_back(AtomicNumber(8), 0.0, 0.0, 0.0);
+  mol.emplace_back(AtomicNumber(8), 0.0, 3.0 * step, 0.0);
+
+  auto basis = make_ccpvdz(mol, SphericalType(true));
+  for (auto& sh : basis) sh.set_shell_tolerance(shell_tol);
+  const int32_t nbf = basis.nbf();
+  auto eval = make_evaluator(basis, shell_tol);
+
+  CubeGrid grid;
+  grid.origin = {-7.0, 0.0, 0.0};
+  grid.spacing = {2.0, step, 2.0};
+  grid.nx = 8;
+  grid.ny = 4;
+  grid.nz = 4;
+  const int64_t npts = grid.num_points();
+  const auto pts = grid.points();
+  const auto ao = reference_collocation(basis, npts, pts.data());
+
+  const auto C = make_random_vector(static_cast<size_t>(nbf), 606u);
+  std::vector<double> D(static_cast<size_t>(nbf) * nbf, 0.0);
+  for (int32_t i = 0; i < nbf; ++i) D[static_cast<size_t>(i) * nbf + i] = 1.0;
+
+  std::vector<double> orb(static_cast<size_t>(npts));
+  std::vector<double> rho(static_cast<size_t>(npts));
+  eval.eval_orbital(grid, C.data(), orb.data());
+  eval.eval_density(grid, D.data(), nbf, rho.data());
+
+  // The far atom has to register on the grid, or nothing is being proved about
+  // whether its shells survived screening.
+  double max_rho = 0.0;
+  for (int64_t p = 0; p < npts; ++p) {
+    const double* a = ao.data() + static_cast<size_t>(p) * nbf;
+    double orb_ref = 0.0, rho_ref = 0.0;
+    for (int32_t mu = 0; mu < nbf; ++mu) {
+      orb_ref += C[static_cast<size_t>(mu)] * a[mu];
+      rho_ref += a[mu] * a[mu];
+    }
+    max_rho = std::max(max_rho, rho_ref);
+    CHECK(orb[p] == Approx(orb_ref).margin(1e-9));
+    CHECK(rho[p] == Approx(rho_ref).margin(1e-9));
+  }
+  CHECK(max_rho > 1e-2);
+}
+
 TEST_CASE("OrbitalEvaluator screens a batch lying inside one grid row",
           "[orbital_evaluator]") {
   // With iz fastest, a contiguous batch shorter than one row is boxed by its
