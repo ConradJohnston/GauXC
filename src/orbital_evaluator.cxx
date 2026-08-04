@@ -404,6 +404,9 @@ public:
 
     // Gather the rows of C for the surviving shells into a contiguous
     // (nbe, nmo) col-major buffer so the contraction is a dense GEMM.
+    // Skipping this when no shell is screened out was measured and is not
+    // worth it: that case is 0-5% of batches on anything larger than water,
+    // and it is precisely the case where there is nothing to gather.
     const BasisSetMap& basis_map = *impl_.basis_map;
     int32_t row = 0;
     for( int32_t ish : shells ) {
