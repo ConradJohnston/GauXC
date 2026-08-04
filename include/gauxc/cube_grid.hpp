@@ -46,6 +46,12 @@ struct CubeGrid {
    *  coincide with the extended bounding-box corners (PySCF cubegen
    *  convention).
    *
+   *  The margin is the same on all three axes, so a flat molecule gets a box
+   *  that is thin in the direction it is flat in. An orbital that reaches out
+   *  that way, such as the pi system of an aromatic ring, can still be large
+   *  where the box ends and will look cut off when plotted. Use a bigger
+   *  margin, or set origin, spacing and point counts yourself, if that matters.
+   *
    *  @param mol     Molecule whose atomic centres define the bounding box.
    *  @param nx,ny,nz Number of grid points along each axis.
    *  @param margin  Margin (Bohr) added on each side. Default 3.0 matches
