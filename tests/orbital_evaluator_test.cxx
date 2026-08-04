@@ -615,6 +615,73 @@ TEST_CASE("OrbitalEvaluator handles single-plane grids", "[orbital_evaluator]") 
   }
 }
 
+TEST_CASE("OrbitalEvaluator density with a general D and padded ldd",
+          "[orbital_evaluator]") {
+  // Every other density test uses a diagonal D and ldd == nbf, and neither
+  // can see a whole class of defect. Permuting an identity on both sides
+  // leaves it unchanged, so a scrambled compressed-submatrix map is invisible
+  // to it; and ldd == nbf makes a leading dimension dropped in favour of nbf
+  // a no-op. Screening has to be active for the compressed submatrix to
+  // differ from D at all, hence the two well-separated centres.
+  Molecule mol;
+  mol.emplace_back(AtomicNumber(8), 0.0, 0.0, 0.0);
+  mol.emplace_back(AtomicNumber(8), 0.0, 0.0, 20.0);
+
+  constexpr double shell_tol = 1e-10;
+  auto basis = make_ccpvdz(mol, SphericalType(true));
+  for (auto& sh : basis) sh.set_shell_tolerance(shell_tol);
+  const int32_t nbf = basis.nbf();
+  auto eval = make_evaluator(basis, shell_tol);
+
+  CubeGrid grid;
+  grid.origin = {-3.0, -3.0, -4.0};
+  grid.spacing = {2.0, 2.0, 1.0};
+  grid.nx = 4;
+  grid.ny = 4;
+  grid.nz = 28;
+  const int64_t npts = grid.num_points();
+  const auto pts = grid.points();
+  const auto ao = reference_collocation(basis, npts, pts.data());
+
+  constexpr double sentinel = -4321.0;
+  const size_t ldd = static_cast<size_t>(nbf) + 6;
+
+  const auto rnd = make_random_vector(static_cast<size_t>(nbf) * nbf, 31337u);
+  std::vector<double> Dsq(static_cast<size_t>(nbf) * nbf);
+  for (int32_t i = 0; i < nbf; ++i)
+    for (int32_t j = 0; j < nbf; ++j)
+      Dsq[static_cast<size_t>(j) * nbf + i] =
+          rnd[static_cast<size_t>(j) * nbf + i] +
+          rnd[static_cast<size_t>(i) * nbf + j];
+
+  // Rows past nbf are poisoned, so an ldd mistaken for nbf reads them.
+  std::vector<double> D(ldd * nbf, sentinel);
+  for (int32_t j = 0; j < nbf; ++j)
+    for (int32_t i = 0; i < nbf; ++i)
+      D[static_cast<size_t>(j) * ldd + i] = Dsq[static_cast<size_t>(j) * nbf + i];
+
+  std::vector<double> rho_grid(static_cast<size_t>(npts));
+  std::vector<double> rho_pts(static_cast<size_t>(npts));
+  eval.eval_density(grid, D.data(), ldd, rho_grid.data());
+  eval.eval_density(npts, pts.data(), D.data(), ldd, rho_pts.data());
+
+  double max_ref = 0.0;
+  for (int64_t p = 0; p < npts; ++p) {
+    const double* a = ao.data() + static_cast<size_t>(p) * nbf;
+    double ref = 0.0;
+    for (int32_t mu = 0; mu < nbf; ++mu) {
+      double acc = 0.0;
+      for (int32_t nu = 0; nu < nbf; ++nu)
+        acc += Dsq[static_cast<size_t>(nu) * nbf + mu] * a[nu];
+      ref += acc * a[mu];
+    }
+    max_ref = std::max(max_ref, std::fabs(ref));
+    CHECK(rho_grid[p] == Approx(ref).margin(1e-8));
+    CHECK(rho_pts[p] == Approx(ref).margin(1e-8));
+  }
+  CHECK(max_ref > 1e-2);
+}
+
 TEST_CASE("OrbitalEvaluator screens a batch lying inside one grid row",
           "[orbital_evaluator]") {
   // With iz fastest, a contiguous batch shorter than one row is boxed by its
