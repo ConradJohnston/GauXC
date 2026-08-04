@@ -91,10 +91,14 @@ def generate_c_gau2grid(max_L,
         # cgs.write("#include <stdio.h>")
         cgs.write("#if defined(__clang__) && defined(_MSC_VER)")
         cgs.write("#include <malloc.h>")
+        if cgs is gg_helper:
+            cgs.write("#include <stdlib.h>")
         cgs.write("#elif defined __clang__")
         cgs.write("#include <mm_malloc.h>")
         cgs.write("#elif defined _MSC_VER")
         cgs.write("#include <malloc.h>")
+        if cgs is gg_helper:
+            cgs.write("#include <stdlib.h>")
         cgs.write("#else")
         cgs.write("#include <stdlib.h>")
         cgs.write("#endif")
@@ -129,10 +133,10 @@ def generate_c_gau2grid(max_L,
     gg_header.write("// Information helpers")
 
     # Maximum angular momentum
-    gg_helper.write("int gg_max_L() { return %d; }" % max_L, endl="")
+    gg_helper.write("int gg_max_L(void) { return %d; }" % max_L, endl="")
     gg_helper.blankline()
 
-    gg_header.write("int gg_max_L()")
+    gg_header.write("int gg_max_L(void)")
     gg_header.blankline()
 
 
@@ -457,7 +461,7 @@ def shell_c_generator(cg, L, function_name="", grad=0, cartesian_order="row", in
     cg.blankline()
 
     cg.write("// Build negative exponents")
-    cg.start_c_block("for (unsigned long i = 0; i < nprim; i++)")
+    cg.start_c_block("for (unsigned long i = 0; i < (unsigned long)nprim; i++)")
     cg.write("expn1[i] = -1.0 * exponents[i]")
     if grad > 0:
         cg.write("expn2[i] = -2.0 * exponents[i]")
@@ -514,7 +518,7 @@ def shell_c_generator(cg, L, function_name="", grad=0, cartesian_order="row", in
     cg.write("} else {", endl="")
 
     # XYZ stripped blocks
-    cg.write("unsigned int start_shift = start * xyz_stride")
+    cg.write("unsigned long start_shift = start * xyz_stride")
     cg.blankline()
 
     cg.write("PRAGMA_VECTORIZE", endl="")
@@ -546,7 +550,7 @@ def shell_c_generator(cg, L, function_name="", grad=0, cartesian_order="row", in
 
     # Start inner loop
     cg.write("// Start exponential block loop")
-    cg.start_c_block("for (unsigned long n = 0; n < nprim; n++)")
+    cg.start_c_block("for (unsigned long n = 0; n < (unsigned long)nprim; n++)")
 
     # Build R2
     cg.write("const double coef = coeffs[n]")
@@ -778,6 +782,10 @@ def shell_c_generator(cg, L, function_name="", grad=0, cartesian_order="row", in
         cg.data[x] = cg.data[x].replace("= 1 * ", "= ")
         cg.data[x] = cg.data[x].replace("= 1.0 * ", "= ")
 
+    # Remove unused temp variable declarations (e.g. double A; double AX, AY, AZ;)
+    # The post-processing above may have inlined away all uses.
+    _remove_unused_decls(cg, cg_line_start)
+
     return func_sig
 
 
@@ -788,9 +796,44 @@ def _make_call(string):
     return string
 
 
+def _remove_unused_decls(cg, start):
+    """Remove 'double X;' declarations where X is never referenced after the declaration."""
+    import re
+    end = len(cg.data)
+    pos = start
+    while pos < end:
+        line = cg.data[pos]
+        # Match bare temp declarations: "    double A;" or "    double AX, AY, AZ;"
+        # Skip const, pointer, or initialized declarations.
+        m = re.match(r'\s+double\s+([A-Z][A-Z, ]*);', line.rstrip())
+        if m and 'const' not in line and '=' not in line and '*' not in line:
+            var_names = [v.strip() for v in m.group(1).split(',')]
+            all_unused = True
+            for vname in var_names:
+                pattern = re.compile(r'\b' + re.escape(vname) + r'\b')
+                for j in range(pos + 1, end):
+                    code_line = cg.data[j].split('//')[0]
+                    if pattern.search(code_line):
+                        all_unused = False
+                        break
+                if not all_unused:
+                    break
+            if all_unused:
+                cg.data.pop(pos)
+                end -= 1
+                continue
+        pos += 1
+
+
 def _malloc(name, size, dtype="double"):
     # return "%s*  %s = (%s*)malloc(%s * sizeof(%s))" % (dtype, name, dtype, str(size), dtype)
-    return "%s* PRAGMA_RESTRICT %s = (%s*)ALIGNED_MALLOC(%d, %s * sizeof(%s))" % (dtype, name, dtype, ALIGN_SIZE, str(size), dtype)
+
+    # The requested memory size of ALIGNED_MALLOC must be a multiple of the alignment width.
+    # This below line rounds the size up to the next multiple of ALIGN_SIZE.
+    # (Note that the arithmetics below are performed by C and are hence integer divisions.)
+    byte_size = "(%s * sizeof(%s))" % (str(size), dtype)
+    rounded_byte_size = "(((%s + %d - 1) / %d) * %d)" % (byte_size, ALIGN_SIZE, ALIGN_SIZE, ALIGN_SIZE)
+    return "%s* PRAGMA_RESTRICT %s = (%s*)ALIGNED_MALLOC(%d, %s)" % (dtype, name, dtype, ALIGN_SIZE, rounded_byte_size)
 
 
 def _block_malloc(cg, block_name, mallocs, dtype="double"):
