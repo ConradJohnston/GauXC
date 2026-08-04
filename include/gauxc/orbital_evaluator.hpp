@@ -41,7 +41,10 @@ namespace detail {
  *  Points are evaluated in batches and each batch is screened against the
  *  per-shell cutoff radii. The batch size is derived in part from the OpenMP
  *  thread count, so results are bit-reproducible for a fixed thread count but
- *  may differ between thread counts by at most the basis-set shell tolerance.
+ *  may differ between thread counts. Each neglected shell contributes at most
+ *  the shell tolerance, so that difference is of the order of the tolerance
+ *  rather than bounded by it: it grows with the number of shells dropped, and
+ *  reaches roughly twice the tolerance on benzene in cc-pVDZ.
  *
  *  Screening cost is governed by the shell tolerance, which the evaluator
  *  applies to its own private copy of the basis, so the caller's basis (and
