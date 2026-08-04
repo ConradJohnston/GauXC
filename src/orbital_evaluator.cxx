@@ -384,7 +384,7 @@ public:
                      const double* C, size_t ldc, double* out, size_t ldo ) :
     impl_(impl), nmo_(nmo), C_(C), ldc_(ldc), out_(out), ldo_(ldo) {}
 
-  void init( Scratch& scr, size_t ) const {
+  void init( Scratch& scr ) const {
     scr.C_compressed.resize( static_cast<size_t>(impl_.nbf_) * nmo_ );
   }
 
@@ -468,7 +468,7 @@ public:
                      size_t ldd, double* out ) :
     impl_(impl), D_(D), ldd_(ldd), out_(out) {}
 
-  void init( Scratch&, size_t ) const {}
+  void init( Scratch& ) const {}
 
   void zero( const BatchSpan& span ) const {
     for( size_t r = 0; r < span.nruns; ++r )
@@ -546,7 +546,7 @@ void batched_eval( const detail::OrbitalEvaluatorImpl& impl,
     std::vector<int32_t> screened_shells;
     screened_shells.reserve( nshells_total );
     typename Contractor::Scratch scr;
-    contract.init( scr, max_pts );
+    contract.init( scr );
 
 #pragma omp for schedule(dynamic, 1)
     for( int64_t b = 0; b < n_batches; ++b ) {
@@ -580,8 +580,9 @@ void batched_eval( const detail::OrbitalEvaluatorImpl& impl,
       // shell size in shell_list order. That holds for the gau2grid path; the
       // non-gau2grid fallback in gau2grid_collocation.cxx instead uses the
       // global shell_to_first_ao offset, which is only equivalent when no
-      // shell is screened out. This is a pre-existing inconsistency in the
-      // reference driver rather than one introduced here.
+      // shell is screened out. That fallback is unreachable in any supported
+      // build (the top-level CMakeLists makes gau2grid a hard dependency), and
+      // the discrepancy is pre-existing rather than introduced here.
       impl.host_driver->eval_collocation( np, screened_shells.size(),
         static_cast<size_t>(nbe), pts, basis, screened_shells.data(),
         ao_buf.data() );
