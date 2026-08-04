@@ -410,6 +410,109 @@ TEST_CASE("OrbitalEvaluator tiled grid traversal matches the reference",
   CHECK(any_nonzero);
 }
 
+TEST_CASE("OrbitalEvaluator scatters multiple orbitals into a padded output",
+          "[orbital_evaluator]") {
+  // A tiled batch is not contiguous in the output, so its result is staged and
+  // scattered column by column. nmo > 1 with a padded ldo is the only
+  // combination that exercises both strides of that scatter. Padding entries
+  // hold sentinels: C must never be read past nbf, out never written past npts.
+  Molecule mol;
+  mol.emplace_back(AtomicNumber(8), 0.0, 0.0, 0.0);
+  mol.emplace_back(AtomicNumber(1), 0.0, 0.0, 20.0);
+
+  constexpr double shell_tol = 1e-10;
+  auto basis = make_ccpvdz(mol, SphericalType(true));
+  for (auto& sh : basis) sh.set_shell_tolerance(shell_tol);
+  const int32_t nbf = basis.nbf();
+  auto eval = make_evaluator(basis, shell_tol);
+
+  CubeGrid grid;
+  grid.origin = {-4.0, -4.0, -6.0};
+  grid.spacing = {2.0, 2.0, 0.8};
+  grid.nx = 4;
+  grid.ny = 4;
+  grid.nz = 40;
+  const int64_t npts = grid.num_points();
+  const auto pts = grid.points();
+  const auto ao_ref = reference_collocation(basis, npts, pts.data());
+
+  constexpr int32_t nmo = 3;
+  constexpr double sentinel = -12345.0;
+  const size_t ldc = static_cast<size_t>(nbf) + 7;
+  const size_t ldo = static_cast<size_t>(npts) + 5;
+
+  const auto Craw = make_random_vector(static_cast<size_t>(nbf) * nmo, 99u);
+  std::vector<double> C(ldc * nmo, sentinel);
+  for (int32_t j = 0; j < nmo; ++j)
+    for (int32_t mu = 0; mu < nbf; ++mu)
+      C[j * ldc + mu] = Craw[static_cast<size_t>(j) * nbf + mu];
+
+  std::vector<double> out(ldo * nmo, sentinel);
+  eval.eval_orbitals(grid, nmo, C.data(), ldc, out.data(), ldo);
+
+  // The pointer overload always batches contiguously, so it checks the tiled
+  // scatter against a different decomposition of the same grid.
+  std::vector<double> out_pts(ldo * nmo, sentinel);
+  eval.eval_orbitals(npts, pts.data(), nmo, C.data(), ldc, out_pts.data(), ldo);
+
+  for (int32_t j = 0; j < nmo; ++j) {
+    for (int64_t p = 0; p < npts; ++p) {
+      double ref = 0.0;
+      for (int32_t mu = 0; mu < nbf; ++mu)
+        ref += Craw[static_cast<size_t>(j) * nbf + mu] *
+               ao_ref[static_cast<size_t>(p) * nbf + mu];
+      const size_t k = static_cast<size_t>(j) * ldo + static_cast<size_t>(p);
+      CHECK(out[k] == Approx(ref).margin(1e-9));
+      CHECK(out[k] == Approx(out_pts[k]).margin(shell_tol));
+    }
+    for (size_t p = static_cast<size_t>(npts); p < ldo; ++p) {
+      CHECK(out[static_cast<size_t>(j) * ldo + p] == sentinel);
+      CHECK(out_pts[static_cast<size_t>(j) * ldo + p] == sentinel);
+    }
+  }
+}
+
+TEST_CASE("OrbitalEvaluator handles single-plane grids", "[orbital_evaluator]") {
+  // An axis of one point gets zero spacing from from_molecule, which the
+  // tile-shaping code must treat as unconstrained rather than divide by.
+  auto mol = make_water();
+  constexpr double shell_tol = 1e-10;
+  auto basis = make_ccpvdz(mol, SphericalType(true));
+  for (auto& sh : basis) sh.set_shell_tolerance(shell_tol);
+  const int32_t nbf = basis.nbf();
+  auto eval = make_evaluator(basis, shell_tol);
+
+  const auto C = make_random_vector(static_cast<size_t>(nbf), 4242u);
+  std::vector<double> D(static_cast<size_t>(nbf) * nbf, 0.0);
+  for (int32_t i = 0; i < nbf; ++i) D[static_cast<size_t>(i) * nbf + i] = 1.0;
+
+  const std::vector<CubeGrid> grids = {CubeGrid::from_molecule(mol, 1, 9, 9),
+                                       CubeGrid::from_molecule(mol, 9, 1, 9),
+                                       CubeGrid::from_molecule(mol, 9, 9, 1)};
+
+  for (const auto& grid : grids) {
+    const int64_t npts = grid.num_points();
+    const auto pts = grid.points();
+    const auto ao = reference_collocation(basis, npts, pts.data());
+
+    std::vector<double> orb(static_cast<size_t>(npts));
+    std::vector<double> rho(static_cast<size_t>(npts));
+    eval.eval_orbital(grid, C.data(), orb.data());
+    eval.eval_density(grid, D.data(), nbf, rho.data());
+
+    for (int64_t p = 0; p < npts; ++p) {
+      double orb_ref = 0.0, rho_ref = 0.0;
+      for (int32_t mu = 0; mu < nbf; ++mu) {
+        const double a = ao[static_cast<size_t>(p) * nbf + mu];
+        orb_ref += C[static_cast<size_t>(mu)] * a;
+        rho_ref += a * a;
+      }
+      CHECK(orb[p] == Approx(orb_ref).margin(1e-9));
+      CHECK(rho[p] == Approx(rho_ref).margin(1e-9));
+    }
+  }
+}
+
 TEST_CASE("OrbitalEvaluator screens a batch lying inside one grid row",
           "[orbital_evaluator]") {
   // With iz fastest, a contiguous batch shorter than one row is boxed by its
