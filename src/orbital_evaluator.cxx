@@ -478,19 +478,22 @@ public:
 
     const size_t np = span.npts;
 
-    // eval_xmat needs nbe*nbe scratch and writes an (nbe,np) block. Growing
-    // both on demand inside the parallel region keeps the high-water mark at
-    // the largest nbe this thread actually saw (not nbf) and first-touches
-    // the pages on the owning thread.
-    const size_t scr_size = static_cast<size_t>(nbe) * nbe;
-    if( scr.xmat_scr.size() < scr_size ) scr.xmat_scr.resize( scr_size );
-    const size_t dm_ao_size = static_cast<size_t>(nbe) * np;
-    if( scr.dm_ao.size() < dm_ao_size ) scr.dm_ao.resize( dm_ao_size );
-
     const int32_t nbf = impl_.nbf_;
     LocalHostWorkDriver::submat_map_t submat_map;
     std::tie( submat_map, std::ignore ) =
       gen_compressed_submat_map( *impl_.basis_map, shells, nbf, nbf );
+
+    // eval_xmat gathers D into scratch only when the surviving shells span
+    // more than one contiguous AO block; a single block is read in place from
+    // D itself, so nbe*nbe is never touched. Growing on demand inside the
+    // parallel region keeps the high-water mark at the largest nbe this thread
+    // actually saw (not nbf) and first-touches the pages on the owning thread.
+    if( submat_map.size() > 1 ) {
+      const size_t scr_size = static_cast<size_t>(nbe) * nbe;
+      if( scr.xmat_scr.size() < scr_size ) scr.xmat_scr.resize( scr_size );
+    }
+    const size_t dm_ao_size = static_cast<size_t>(nbe) * np;
+    if( scr.dm_ao.size() < dm_ao_size ) scr.dm_ao.resize( dm_ao_size );
 
     // dm_ao = D_compressed @ ao
     impl_.host_driver->eval_xmat( np, static_cast<size_t>(nbf),
