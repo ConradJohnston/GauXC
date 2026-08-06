@@ -842,9 +842,9 @@ TEST_CASE("OrbitalEvaluator screens a tile spanning part of a long axis",
 TEST_CASE("OrbitalEvaluator survives a thread-count change after construction",
           "[orbital_evaluator]") {
   // Regression guard: scratch must follow the thread count in force at
-  // evaluation time, not at construction. Batch shape is derived from the
-  // thread count, so the two runs screen slightly differently and agree to
-  // within the shell tolerance rather than bitwise.
+  // evaluation time, not at construction. Nothing about the batch
+  // decomposition depends on the thread count, so the two runs screen
+  // identically and have to agree bitwise.
   auto mol = make_water();
   auto basis = make_ccpvdz(mol, SphericalType(true));
   constexpr double shell_tol = 1e-12;
@@ -885,19 +885,22 @@ TEST_CASE("OrbitalEvaluator survives a thread-count change after construction",
 #endif
 
   for (int64_t p = 0; p < npts; ++p) {
-    CHECK(orb_par[p] == Approx(orb_serial[p]).margin(shell_tol));
-    CHECK(rho_par[p] == Approx(rho_serial[p]).margin(shell_tol));
+    CHECK(orb_par[p] == orb_serial[p]);
+    CHECK(rho_par[p] == rho_serial[p]);
   }
 }
 
-TEST_CASE("OrbitalEvaluator thread-count dependence is bounded by screening",
+TEST_CASE("OrbitalEvaluator results do not depend on the thread count",
           "[orbital_evaluator]") {
-  // Batch size is derived from the thread count, so when screening is active
-  // different thread counts screen against different batch bounding boxes and
-  // the results are not bit-identical. Each dropped shell contributes at most
-  // the shell tolerance and the errors accumulate, so the bound scales with
-  // how many can be dropped; nbf is the generous ceiling on that. Still eight
-  // orders below the field itself, so it remains a real constraint.
+  // The batch decomposition is derived from the point count and the basis
+  // alone, so every thread count screens against the same set of bounding
+  // boxes and has to return the same bits. Deriving it from the thread count
+  // instead is the easy mistake, and two things have to hold for that mistake
+  // to be visible. Screening must be active, hence two centres 20 Bohr apart
+  // with plenty of empty grid around them. And the batch size must be free to
+  // move: below kMinBatches * kMinBatch points the minimum-batch-count bound
+  // rounds away and the batch floor pins the batch whatever the thread count,
+  // so the grid is deliberately larger than that.
   Molecule mol;
   mol.emplace_back(AtomicNumber(8), 0.0, 0.0, 0.0);
   mol.emplace_back(AtomicNumber(1), 20.0, 0.0, 0.0);
@@ -909,34 +912,52 @@ TEST_CASE("OrbitalEvaluator thread-count dependence is bounded by screening",
 
   CubeGrid grid;
   grid.origin = {-4.0, -4.0, -4.0};
-  grid.spacing = {0.8, 2.0, 2.0};
-  grid.nx = 40;
-  grid.ny = 4;
-  grid.nz = 4;
-  const int64_t npts = grid.num_points();
+  grid.spacing = {0.2, 0.5, 0.5};
+  grid.nx = 160;
+  grid.ny = 32;
+  grid.nz = 32;
+  const auto npts = static_cast<size_t>(grid.num_points());
+  REQUIRE(npts > 65536);
 
+  const auto C = make_random_vector(static_cast<size_t>(nbf), 1618u);
   std::vector<double> D(static_cast<size_t>(nbf) * nbf, 0.0);
   for (int32_t i = 0; i < nbf; ++i) D[i * nbf + i] = 1.0;
 
-  std::vector<double> rho_serial(static_cast<size_t>(npts));
-  std::vector<double> rho_par(static_cast<size_t>(npts));
+  std::vector<double> orb_ref(npts), rho_ref(npts);
+  std::vector<double> orb(npts), rho(npts);
 
 #ifdef _OPENMP
   const int saved_threads = omp_get_max_threads();
   omp_set_num_threads(1);
 #endif
-  eval.eval_density(grid, D.data(), nbf, rho_serial.data());
+  eval.eval_orbital(grid, C.data(), orb_ref.data());
+  eval.eval_density(grid, D.data(), nbf, rho_ref.data());
+
+  // Screening has to be doing something, or the invariance is vacuous.
+  double max_rho = 0.0;
+  for (size_t p = 0; p < npts; ++p) max_rho = std::max(max_rho, rho_ref[p]);
+  REQUIRE(max_rho > 1e-2);
+
+  size_t orb_diff = 0, rho_diff = 0;
+  for (int nthreads : {2, 3, 5, 8, 13, 16, 32}) {
 #ifdef _OPENMP
-  omp_set_num_threads(saved_threads > 1 ? saved_threads : 2);
+    omp_set_num_threads(nthreads);
+#else
+    (void)nthreads;
 #endif
-  eval.eval_density(grid, D.data(), nbf, rho_par.data());
+    eval.eval_orbital(grid, C.data(), orb.data());
+    eval.eval_density(grid, D.data(), nbf, rho.data());
+    for (size_t p = 0; p < npts; ++p) {
+      if (orb[p] != orb_ref[p]) ++orb_diff;
+      if (rho[p] != rho_ref[p]) ++rho_diff;
+    }
+  }
 #ifdef _OPENMP
   omp_set_num_threads(saved_threads);
 #endif
 
-  for (int64_t p = 0; p < npts; ++p) {
-    CHECK(rho_par[p] == Approx(rho_serial[p]).margin(nbf * shell_tol));
-  }
+  CHECK(orb_diff == 0);
+  CHECK(rho_diff == 0);
 }
 
 TEST_CASE("OrbitalEvaluator screening error scales with the shell tolerance",

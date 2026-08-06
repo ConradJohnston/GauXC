@@ -19,12 +19,6 @@
 #include <tuple>
 #include <vector>
 
-#ifdef _OPENMP
-#include <omp.h>
-#else
-inline int omp_get_max_threads() { return 1; }
-#endif
-
 #include <gauxc/exceptions.hpp>
 #include <gauxc/molecule.hpp>
 
@@ -81,19 +75,27 @@ namespace {
  *       collocation kernel's own transpose staging, and, for density, the
  *       D*AO product. They are sized to share ~1 MiB, a typical per-core L2,
  *       rather than allowing each block that much on its own.
- *    2. Load balance: enough batches that each thread gets several, i.e.
- *       batch <= npts / (4*nthreads).
+ *    2. Load balance: at least kMinBatches batches, so that every thread of a
+ *       wide machine gets several.
+ *
+ *  The second bound is a fixed count rather than a multiple of the thread
+ *  count. Batch shape decides which shells screen out, so taking the thread
+ *  count here would make the numbers depend on it. 1024 covers 256 threads at
+ *  four batches each, and the batches it forces on a narrower machine cost
+ *  little: against a run with the bound lifted entirely, benzene/cc-pVDZ at
+ *  64^3 serial was ~4% slower on orbitals and ~10% faster on density, and
+ *  water was faster on both at 1 and 16 threads.
  *
  *  Only the batch-proportional blocks are budgeted here. The gathers that
  *  depend on nbe alone -- D compressed to nbe*nbe, C compressed to nbe*nmo --
  *  are unaffected by the batch size, so no choice made here bounds them; on a
  *  large basis with weak screening the nbe*nbe gather dominates this budget.
  */
-size_t choose_batch_size( int32_t nbf, size_t npts, int nthreads,
-                          int nscratch ) {
+size_t choose_batch_size( int32_t nbf, size_t npts, int nscratch ) {
   constexpr size_t kTargetScratchBytesPerThread = 1024 * 1024;
   constexpr size_t kMinBatch = 128;
   constexpr size_t kMaxBatch = 8192;
+  constexpr size_t kMinBatches = 1024;
 
   size_t batch = kMaxBatch;
   if( nbf > 0 ) {
@@ -101,9 +103,7 @@ size_t choose_batch_size( int32_t nbf, size_t npts, int nthreads,
             ( sizeof(double) * static_cast<size_t>(nbf) *
               static_cast<size_t>(nscratch) );
   }
-  if( nthreads > 0 ) {
-    batch = std::min( batch, npts / ( 4 * static_cast<size_t>(nthreads) ) );
-  }
+  batch = std::min( batch, npts / kMinBatches );
   return std::clamp( batch, kMinBatch, kMaxBatch );
 }
 
@@ -546,7 +546,7 @@ size_t batch_target( int32_t nbf, size_t npts ) {
   constexpr int collocation_scratch_blocks = 1;
   const int nscratch =
     1 + collocation_scratch_blocks + Contractor::scratch_blocks;
-  return choose_batch_size( nbf, npts, omp_get_max_threads(), nscratch );
+  return choose_batch_size( nbf, npts, nscratch );
 }
 
 void check_orbital_args( const std::string& ctx, size_t npts, int32_t nbf,

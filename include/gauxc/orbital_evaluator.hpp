@@ -39,18 +39,18 @@ namespace detail {
  *  `gauxc/external/cube.hpp`.
  *
  *  Points are evaluated in batches and each batch is screened against the
- *  per-shell cutoff radii. The batch size is derived in part from the OpenMP
- *  thread count, so results are bit-reproducible for a fixed thread count but
- *  may differ between thread counts. Each neglected shell contributes at most
- *  the shell tolerance, so that difference is of the order of the tolerance
- *  rather than bounded by it: it grows with the number of shells dropped, and
- *  reaches roughly twice the tolerance on benzene in cc-pVDZ.
+ *  per-shell cutoff radii. The batch decomposition is derived from the point
+ *  count and the basis alone, never from the thread count, so results are
+ *  bitwise reproducible from run to run and across thread counts.
  *
- *  For the same reason the CubeGrid overloads are not bitwise equal to the
- *  pointer overloads given the same points. A CubeGrid is walked in spatially
- *  compact tiles, which screen better, whereas a caller-supplied point array
- *  is batched in the order it arrives; the two decompositions drop different
- *  shells and so agree to the shell tolerance rather than bitwise.
+ *  The CubeGrid overloads are not bitwise equal to the pointer overloads given
+ *  the same points, however. A CubeGrid is walked in spatially compact tiles,
+ *  which screen better, whereas a caller-supplied point array is batched in
+ *  the order it arrives, so the two drop different shells. Each neglected
+ *  shell contributes at most the shell tolerance, which makes the difference
+ *  of the order of the tolerance rather than bounded by it: it grows with the
+ *  number of shells dropped, and reaches roughly twice the tolerance on
+ *  benzene in cc-pVDZ.
  *
  *  Screening cost is governed by the shell tolerance, which the evaluator
  *  applies to its own private copy of the basis, so the caller's basis (and
