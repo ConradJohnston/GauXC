@@ -76,13 +76,18 @@ namespace {
 /** @brief Choose the number of points evaluated per batch.
  *
  *  Two constraints, whichever is tighter:
- *    1. Cache footprint. Each thread holds `nscratch` live blocks of
- *       nbf*batch doubles: the AO block, the collocation kernel's own
- *       transpose staging, and, for density, the D*AO product. They are
- *       sized to share ~1 MiB, a typical per-core L2, rather than allowing
- *       each block that much on its own.
+ *    1. Cache footprint of the blocks that scale with the batch. Each thread
+ *       holds `nscratch` live blocks of nbf*batch doubles: the AO block, the
+ *       collocation kernel's own transpose staging, and, for density, the
+ *       D*AO product. They are sized to share ~1 MiB, a typical per-core L2,
+ *       rather than allowing each block that much on its own.
  *    2. Load balance: enough batches that each thread gets several, i.e.
  *       batch <= npts / (4*nthreads).
+ *
+ *  Only the batch-proportional blocks are budgeted here. The gathers that
+ *  depend on nbe alone -- D compressed to nbe*nbe, C compressed to nbe*nmo --
+ *  are unaffected by the batch size, so no choice made here bounds them; on a
+ *  large basis with weak screening the nbe*nbe gather dominates this budget.
  */
 size_t choose_batch_size( int32_t nbf, size_t npts, int nthreads,
                           int nscratch ) {
