@@ -454,11 +454,11 @@ TEST_CASE("OrbitalEvaluator shell screening", "[orbital_evaluator]") {
 
 TEST_CASE("OrbitalEvaluator tiled grid traversal matches the reference",
           "[orbital_evaluator]") {
-  // Grids spanning well beyond a cutoff radius along z are walked in spatial
-  // tiles rather than contiguous index ranges. The 32 Bohr z extent here is
-  // several times the largest cc-pVDZ cutoff radius (13.2 Bohr), so the tiled
-  // path stays selected; the two centres are far enough apart that screening
-  // is active within it.
+  // Grids are walked in spatial tiles rather than contiguous index ranges, so
+  // a tile's points are scattered into the output. The two centres here are
+  // far enough apart that screening is active, and the 32 Bohr z extent is
+  // several times the largest cc-pVDZ cutoff radius (13.2 Bohr), so tiles at
+  // opposite ends of the grid see different shell sets.
   Molecule mol;
   mol.emplace_back(AtomicNumber(8), 0.0, 0.0, 0.0);
   mol.emplace_back(AtomicNumber(1), 0.0, 0.0, 20.0);
@@ -682,19 +682,25 @@ TEST_CASE("OrbitalEvaluator density with a general D and padded ldd",
   CHECK(max_ref > 1e-2);
 }
 
-TEST_CASE("OrbitalEvaluator boxes a multi-row batch out to its far face",
+TEST_CASE("OrbitalEvaluator boxes a batch out to its far face",
           "[orbital_evaluator]") {
-  // A batch spanning more than one row is boxed by the whole extent of the
-  // faster axes. Computing that box one grid step short would screen out a
-  // shell sitting on the far face, and those points would lose it entirely.
+  // A batch is screened against the box drawn round its own points. Building
+  // that box one grid step short on any axis would drop a shell sitting on the
+  // far face, and the points there would lose it entirely.
   //
   // One step has to be decisive for this to be visible at all. A shell only
   // dropped by a one-step shrink lies between cutoff-step and cutoff of the
   // box, where by construction it contributes about the shell tolerance, so a
   // fine grid hides the error inside the tolerance it is measured against.
-  // The spacing along the axis under test is therefore set to 1.5x the largest
-  // cutoff radius, measured from the basis rather than assumed, which puts a
-  // shell on the far face either fully in or fully out.
+  // The spacing is therefore set to 1.5x the largest cutoff radius, measured
+  // from the basis rather than assumed, which puts a shell on a tile face
+  // either fully in or fully out.
+  //
+  // Which grid point lands on a tile face depends on how the grid is
+  // subdivided, which is not observable from here and moves with the batch
+  // size, so the atom is swept over every grid point instead. Six points an
+  // axis puts it on a low face, a far face and an interior point of every
+  // axis under any tiling the batch size can produce.
   constexpr double shell_tol = 1e-10;
 
   double radius = 0.0;
@@ -708,67 +714,65 @@ TEST_CASE("OrbitalEvaluator boxes a multi-row batch out to its far face",
   REQUIRE(radius > 1.0);
   const double step = 1.5 * radius;
 
-  // Only the y axis is worth testing this way. Making the z shrink decisive
-  // would need a z spacing above the cutoff radius, and a grid that coarse in
-  // z has a z extent past the tiling threshold, so it takes the tiled path and
-  // never builds this box at all. With nz == 1 the shrunk corner falls below
-  // the low corner and the min/max that follows widens the box instead of
-  // narrowing it. Either way a z shrink here cannot lose a shell.
-  Molecule mol;
-  mol.emplace_back(AtomicNumber(8), 0.0, 0.0, 0.0);
-  mol.emplace_back(AtomicNumber(8), 0.0, 3.0 * step, 0.0);
-
-  auto basis = make_ccpvdz(mol, SphericalType(true));
-  for (auto& sh : basis) sh.set_shell_tolerance(shell_tol);
-  const int32_t nbf = basis.nbf();
-  auto eval = make_evaluator(basis, shell_tol);
-
   CubeGrid grid;
-  grid.origin = {-7.0, 0.0, 0.0};
-  grid.spacing = {2.0, step, 2.0};
-  grid.nx = 8;
-  grid.ny = 4;
-  grid.nz = 4;
+  grid.origin = {0.0, 0.0, 0.0};
+  grid.spacing = {step, step, step};
+  grid.nx = 6;
+  grid.ny = 6;
+  grid.nz = 6;
   const int64_t npts = grid.num_points();
   const auto pts = grid.points();
-  const auto ao = reference_collocation(basis, npts, pts.data());
 
-  const auto C = make_random_vector(static_cast<size_t>(nbf), 606u);
-  std::vector<double> D(static_cast<size_t>(nbf) * nbf, 0.0);
-  for (int32_t i = 0; i < nbf; ++i) D[static_cast<size_t>(i) * nbf + i] = 1.0;
+  double worst_orb = 0.0, worst_rho = 0.0, max_rho = 0.0;
+  for (int64_t site = 0; site < npts; ++site) {
+    Molecule mol;
+    mol.emplace_back(AtomicNumber(8), pts[3 * site + 0], pts[3 * site + 1],
+                     pts[3 * site + 2]);
 
-  std::vector<double> orb(static_cast<size_t>(npts));
-  std::vector<double> rho(static_cast<size_t>(npts));
-  eval.eval_orbital(grid, C.data(), orb.data());
-  eval.eval_density(grid, D.data(), nbf, rho.data());
+    auto basis = make_ccpvdz(mol, SphericalType(true));
+    for (auto& sh : basis) sh.set_shell_tolerance(shell_tol);
+    const int32_t nbf = basis.nbf();
+    auto eval = make_evaluator(basis, shell_tol);
+    const auto ao = reference_collocation(basis, npts, pts.data());
 
-  // The far atom has to register on the grid, or nothing is being proved about
-  // whether its shells survived screening.
-  double max_rho = 0.0;
-  for (int64_t p = 0; p < npts; ++p) {
-    const double* a = ao.data() + static_cast<size_t>(p) * nbf;
-    double orb_ref = 0.0, rho_ref = 0.0;
-    for (int32_t mu = 0; mu < nbf; ++mu) {
-      orb_ref += C[static_cast<size_t>(mu)] * a[mu];
-      rho_ref += a[mu] * a[mu];
+    const auto C = make_random_vector(static_cast<size_t>(nbf), 606u);
+    std::vector<double> D(static_cast<size_t>(nbf) * nbf, 0.0);
+    for (int32_t i = 0; i < nbf; ++i) D[static_cast<size_t>(i) * nbf + i] = 1.0;
+
+    std::vector<double> orb(static_cast<size_t>(npts));
+    std::vector<double> rho(static_cast<size_t>(npts));
+    eval.eval_orbital(grid, C.data(), orb.data());
+    eval.eval_density(grid, D.data(), nbf, rho.data());
+
+    for (int64_t p = 0; p < npts; ++p) {
+      const double* a = ao.data() + static_cast<size_t>(p) * nbf;
+      double orb_ref = 0.0, rho_ref = 0.0;
+      for (int32_t mu = 0; mu < nbf; ++mu) {
+        orb_ref += C[static_cast<size_t>(mu)] * a[mu];
+        rho_ref += a[mu] * a[mu];
+      }
+      max_rho = std::max(max_rho, rho_ref);
+      worst_orb = std::max(worst_orb, std::fabs(orb[p] - orb_ref));
+      worst_rho = std::max(worst_rho, std::fabs(rho[p] - rho_ref));
     }
-    max_rho = std::max(max_rho, rho_ref);
-    CHECK(orb[p] == Approx(orb_ref).margin(1e-9));
-    CHECK(rho[p] == Approx(rho_ref).margin(1e-9));
   }
+
+  CHECK(worst_orb < 1e-9);
+  CHECK(worst_rho < 1e-9);
+  // The atom has to register on the grid, or nothing is being proved about
+  // whether its shells survived screening.
   CHECK(max_rho > 1e-2);
 }
 
-TEST_CASE("OrbitalEvaluator screens a batch lying inside one grid row",
+TEST_CASE("OrbitalEvaluator screens a tile spanning part of a long axis",
           "[orbital_evaluator]") {
-  // With iz fastest, a contiguous batch shorter than one row is boxed by its
-  // own z sub-range rather than the whole axis. Three things have to line up
-  // for that box to matter. The row must outlast a batch, so nz exceeds the
-  // batch size. The grid must stay off the tiled path, so the z extent sits
-  // inside the tiling threshold of twice the median cutoff radius, derived
-  // here from the basis rather than hard-coded. And the molecule must sit at
-  // the far end of z, so that shrinking the box moves the face nearest the
-  // shells and changes what survives screening.
+  // A tile covers a sub-range of each axis, so on a grid far longer in z than
+  // the tile is, the box has to close around that sub-range rather than the
+  // whole axis. Three things have to line up for that to matter. The axis must
+  // outlast a tile, so nz is far above any tile extent. The grid must span
+  // well past a cutoff radius, taken here from the basis rather than
+  // hard-coded. And the molecule must sit at the far end of z, so that a box
+  // reaching further than its own points changes what survives screening.
   auto mol = make_water();
 
   constexpr double shell_tol = 1e-10;
@@ -783,7 +787,7 @@ TEST_CASE("OrbitalEvaluator screens a batch lying inside one grid row",
   std::nth_element(radii.begin(), radii.begin() + mid, radii.end());
   const double median_radius = radii[mid];
 
-  const double z_extent = 1.8 * median_radius;
+  const double z_extent = 4.0 * median_radius;
 
   CubeGrid grid;
   grid.nx = 1;
@@ -807,22 +811,13 @@ TEST_CASE("OrbitalEvaluator screens a batch lying inside one grid row",
   std::vector<double> orb_pts(static_cast<size_t>(npts));
   std::vector<double> rho_pts(static_cast<size_t>(npts));
 
-#ifdef _OPENMP
-  const int saved_threads = omp_get_max_threads();
-  // Serial so the batch is npts/4 rather than thread-count dependent, which
-  // puts three quarters of a row in one batch on any machine.
-  omp_set_num_threads(1);
-#endif
   auto eval = make_evaluator(basis, shell_tol);
   eval.eval_orbital(grid, C.data(), orb.data());
   eval.eval_density(grid, D.data(), nbf, rho.data());
   // The pointer overload boxes the points it is handed instead of deriving a
-  // box from grid indices, so it checks the index arithmetic independently.
+  // box from tile indices, so it checks the index arithmetic independently.
   eval.eval_orbital(npts, pts.data(), C.data(), orb_pts.data());
   eval.eval_density(npts, pts.data(), D.data(), nbf, rho_pts.data());
-#ifdef _OPENMP
-  omp_set_num_threads(saved_threads);
-#endif
 
   for (int64_t p = 0; p < npts; ++p) {
     double orb_ref = 0.0, rho_ref = 0.0;
@@ -837,7 +832,7 @@ TEST_CASE("OrbitalEvaluator screens a batch lying inside one grid row",
     CHECK(rho[p] == Approx(rho_pts[p]).margin(shell_tol));
   }
 
-  // Pins the span the batch box is being asked to resolve: the row ends on
+  // Pins the span the tile box is being asked to resolve: the row ends on
   // the molecule and starts far enough away for shells to have died off.
   const size_t row_end = static_cast<size_t>(grid.nz) - 1;
   CHECK(rho[row_end] > 1e-2);

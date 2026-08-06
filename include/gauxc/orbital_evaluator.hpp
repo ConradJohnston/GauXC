@@ -46,6 +46,12 @@ namespace detail {
  *  rather than bounded by it: it grows with the number of shells dropped, and
  *  reaches roughly twice the tolerance on benzene in cc-pVDZ.
  *
+ *  For the same reason the CubeGrid overloads are not bitwise equal to the
+ *  pointer overloads given the same points. A CubeGrid is walked in spatially
+ *  compact tiles, which screen better, whereas a caller-supplied point array
+ *  is batched in the order it arrives; the two decompositions drop different
+ *  shells and so agree to the shell tolerance rather than bitwise.
+ *
  *  Screening cost is governed by the shell tolerance, which the evaluator
  *  applies to its own private copy of the basis, so the caller's basis (and
  *  any SCF setup sharing it) is left untouched. Orbital error tracks the

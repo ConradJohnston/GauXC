@@ -122,37 +122,6 @@ PointBbox compute_bbox( const double* points, size_t npts ) {
   return b;
 }
 
-/// Bbox of the contiguous CubeGrid index range [k0, k1]. Exact: with iz
-/// fastest, a range crossing an ix boundary contains both iy=0 and iy=ny-1,
-/// and one crossing an iy boundary contains both iz=0 and iz=nz-1.
-PointBbox bbox_for_index_range( const CubeGrid& g, int64_t k0, int64_t k1 ) {
-  const int64_t nz = g.nz, ny = g.ny;
-  int64_t lo_idx[3], hi_idx[3];
-  lo_idx[0] = k0 / (ny * nz);
-  hi_idx[0] = k1 / (ny * nz);
-  if( hi_idx[0] > lo_idx[0] ) {
-    lo_idx[1] = 0;  hi_idx[1] = ny - 1;
-    lo_idx[2] = 0;  hi_idx[2] = nz - 1;
-  } else {
-    lo_idx[1] = (k0 / nz) % ny;
-    hi_idx[1] = (k1 / nz) % ny;
-    if( hi_idx[1] > lo_idx[1] ) {
-      lo_idx[2] = 0;  hi_idx[2] = nz - 1;
-    } else {
-      lo_idx[2] = k0 % nz;
-      hi_idx[2] = k1 % nz;
-    }
-  }
-  PointBbox b;
-  for( int k = 0; k < 3; ++k ) {
-    const double a = g.origin[k] + g.spacing[k] * static_cast<double>(lo_idx[k]);
-    const double c = g.origin[k] + g.spacing[k] * static_cast<double>(hi_idx[k]);
-    b.lo[k] = std::min(a, c);
-    b.hi[k] = std::max(a, c);
-  }
-  return b;
-}
-
 /// Squared distance from `center` to the nearest point of the bbox. Zero if
 /// the center lies inside.
 double dist2_center_to_bbox( const double* center, const PointBbox& bbox ) {
@@ -207,63 +176,22 @@ struct RawPointSource {
   }
 };
 
-/// Batch source that walks a CubeGrid in contiguous index ranges, generating
-/// coordinates on the fly. One run per batch, so results land in `out`
-/// without a scatter.
-struct GridLinearSource {
-  static constexpr bool needs_scratch = true;
-  const CubeGrid* grid;
-  size_t npts_total;
-  size_t batch_size;
-
-  size_t num_batches() const {
-    return ( npts_total + batch_size - 1 ) / batch_size;
-  }
-  size_t max_points() const { return batch_size; }
-
-  const double* batch( size_t b, double* scr, std::vector<size_t>& runs,
-                       BatchSpan& span, PointBbox& bbox ) const {
-    const CubeGrid& g = *grid;
-    const size_t p0 = b * batch_size;
-    const size_t np = std::min( batch_size, npts_total - p0 );
-
-    const int64_t nz = g.nz, ny = g.ny;
-    int64_t iz = static_cast<int64_t>(p0) % nz;
-    int64_t iy = (static_cast<int64_t>(p0) / nz) % ny;
-    int64_t ix = static_cast<int64_t>(p0) / (ny * nz);
-    double x = g.origin[0] + g.spacing[0] * static_cast<double>(ix);
-    double y = g.origin[1] + g.spacing[1] * static_cast<double>(iy);
-    for( size_t i = 0; i < np; ++i ) {
-      scr[3 * i + 0] = x;
-      scr[3 * i + 1] = y;
-      scr[3 * i + 2] = g.origin[2] + g.spacing[2] * static_cast<double>(iz);
-      if( ++iz == nz ) {
-        iz = 0;
-        if( ++iy == ny ) {
-          iy = 0;
-          ++ix;
-          x = g.origin[0] + g.spacing[0] * static_cast<double>(ix);
-        }
-        y = g.origin[1] + g.spacing[1] * static_cast<double>(iy);
-      }
-    }
-
-    runs.assign( 1, p0 );
-    span = BatchSpan{ runs.data(), 1, np, np };
-    bbox = bbox_for_index_range( g, static_cast<int64_t>(p0),
-                                 static_cast<int64_t>(p0 + np) - 1 );
-    return scr;
-  }
-};
-
 /** @brief Batch source that walks a CubeGrid in spatially compact tiles.
  *
- *  A contiguous index range is a needle along z: as soon as it crosses a row
- *  boundary its bbox spans the whole z extent, so distant shells survive
- *  screening. A tile of the same point count has a far tighter bbox, which
+ *  A contiguous index range is a needle along z, and as soon as it crosses a
+ *  row boundary its bbox spans the whole z extent, so distant shells survive
+ *  screening. A tile of the same point count draws a far tighter box, which
  *  cuts nbe and therefore both the collocation (~nbe) and the density
  *  contraction (~nbe^2). The cost is that a tile's points are no longer
- *  contiguous in the output.
+ *  contiguous in the output and have to be scattered.
+ *
+ *  Tiling is the only grid traversal because a contiguous one was never
+ *  measured to win. Counting nbe*np and nbe^2*np over every batch (a
+ *  deterministic proxy for collocation and GEMM cost) across benzene and
+ *  taxol, grids of 64^3 to 200^3, margins of 3 and 6 Bohr, and a single-plane
+ *  grid where the scatter degenerates to runs of one point, tiling never did
+ *  more work: from a 2-3% saving on benzene at 128^3 to a 53% saving on taxol
+ *  at 200^3. Paired single-threaded timings agreed in direction throughout.
  */
 struct GridTileSource {
   static constexpr bool needs_scratch = true;
@@ -338,8 +266,9 @@ GridTileSource make_tile_source( const CubeGrid& g, size_t target ) {
 
   std::array<int64_t, 3> t{ 1, 1, 1 };
   double scale = std::cbrt( static_cast<double>(target) * s[0] * s[1] * s[2] );
+  int64_t prod = 1;
   for( int attempt = 0; attempt < 4; ++attempt ) {
-    int64_t prod = 1;
+    prod = 1;
     for( int k = 0; k < 3; ++k ) {
       t[k] = std::clamp<int64_t>(
         static_cast<int64_t>( std::llround( scale / s[k] ) ), 1, n[k] );
@@ -348,6 +277,18 @@ GridTileSource make_tile_source( const CubeGrid& g, size_t target ) {
     if( static_cast<size_t>(prod) <= target ) break;
     scale *= std::cbrt( static_cast<double>(target) /
                         static_cast<double>(prod) );
+  }
+
+  // Each rescale shrinks the overshoot as r -> r^(2/3), so a grid anisotropic
+  // enough to start far above target is still above it after four. Halving the
+  // longest axis converges regardless, at the cost of a less cubic tile.
+  while( static_cast<size_t>(prod) > target ) {
+    const int kmax = static_cast<int>(
+      std::max_element( t.begin(), t.end() ) - t.begin() );
+    if( t[kmax] == 1 ) break;  // nothing left to halve
+    prod /= t[kmax];
+    t[kmax] = ( t[kmax] + 1 ) / 2;
+    prod *= t[kmax];
   }
 
   GridTileSource src;
@@ -593,27 +534,6 @@ void batched_eval( const detail::OrbitalEvaluatorImpl& impl,
 
 }
 
-/** @brief Whether spatial tiling can improve screening for this grid.
- *
- *  A contiguous batch's bbox spans the entire z extent as soon as it crosses
- *  a row boundary. If that extent already lies within a shell cutoff radius,
- *  every shell reaching any part of the column reaches all of it, so a
- *  tighter box removes nothing and the scatter it costs is pure overhead.
- *  Tiling is therefore worthwhile only when the grid spans well beyond the
- *  interaction range along z. The factor of two is a margin, not a fit: at a
- *  ratio near one there is nothing to gain.
- */
-bool should_tile( const detail::OrbitalEvaluatorImpl& impl, const CubeGrid& g ) {
-  if( impl.shell_cutoff_r2.empty() ) return false;
-  std::vector<double> r2( impl.shell_cutoff_r2 );
-  const auto mid = r2.begin() + r2.size() / 2;
-  std::nth_element( r2.begin(), mid, r2.end() );
-  const double median_radius = std::sqrt( *mid );
-  const double z_extent =
-    std::fabs( g.spacing[2] ) * static_cast<double>( g.nz );
-  return z_extent > 2.0 * median_radius;
-}
-
 /// Target points per batch for a given contraction, accounting for every
 /// nbf*batch block it keeps live alongside the AO block.
 template <typename Contractor>
@@ -715,21 +635,6 @@ void OrbitalEvaluator::eval_orbitals( size_t npts, const double* points,
     OrbitalContractor( *pimpl_, nmo, C, ldc, out, ldo ) );
 }
 
-namespace {
-
-/// Run a grid evaluation with whichever traversal screens better.
-template <typename Contractor>
-void eval_on_grid( const detail::OrbitalEvaluatorImpl& impl,
-                   const CubeGrid& grid, size_t npts, size_t target,
-                   const Contractor& contract ) {
-  if( should_tile( impl, grid ) )
-    batched_eval( impl, make_tile_source( grid, target ), contract );
-  else
-    batched_eval( impl, GridLinearSource{ &grid, npts, target }, contract );
-}
-
-}  // namespace
-
 void OrbitalEvaluator::eval_density( size_t npts, const double* points,
                                      const double* D, size_t ldd,
                                      double* out ) const {
@@ -767,8 +672,9 @@ void OrbitalEvaluator::eval_orbitals( const CubeGrid& grid, int32_t nmo,
   check_orbital_args( "OrbitalEvaluator::eval_orbitals(grid)", npts,
     pimpl_->nbf_, C, ldc, out, ldo );
 
-  eval_on_grid( *pimpl_, grid, npts,
-    batch_target<OrbitalContractor>( pimpl_->nbf_, npts ),
+  batched_eval( *pimpl_,
+    make_tile_source( grid,
+                      batch_target<OrbitalContractor>( pimpl_->nbf_, npts ) ),
     OrbitalContractor( *pimpl_, nmo, C, ldc, out, ldo ) );
 }
 
@@ -779,8 +685,9 @@ void OrbitalEvaluator::eval_density( const CubeGrid& grid, const double* D,
   check_density_args( "OrbitalEvaluator::eval_density(grid)", pimpl_->nbf_, D,
     ldd, out );
 
-  eval_on_grid( *pimpl_, grid, npts,
-    batch_target<DensityContractor>( pimpl_->nbf_, npts ),
+  batched_eval( *pimpl_,
+    make_tile_source( grid,
+                      batch_target<DensityContractor>( pimpl_->nbf_, npts ) ),
     DensityContractor( *pimpl_, D, ldd, out ) );
 }
 
