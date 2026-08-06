@@ -20,6 +20,7 @@
 #include <random>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <gauxc/external/cube.hpp>
@@ -888,6 +889,74 @@ TEST_CASE("OrbitalEvaluator survives a thread-count change after construction",
     CHECK(orb_par[p] == orb_serial[p]);
     CHECK(rho_par[p] == rho_serial[p]);
   }
+}
+
+TEST_CASE("OrbitalEvaluator is safe to invoke concurrently through const",
+          "[orbital_evaluator]") {
+  // The evaluator holds no mutable state, so a const invocation has to be safe
+  // both from several threads at once and from inside an existing parallel
+  // region. Neither mode crashed when scratch was shared between them; they
+  // silently returned wrong numbers, which is why they are pinned here rather
+  // than left to the thread-count test to catch.
+  //
+  // Nothing here changes the thread count, so every run derives the same batch
+  // shape and screens identically. Agreement is therefore bitwise: any
+  // difference at all means state leaked between calls.
+  auto mol = make_water();
+  constexpr double shell_tol = 1e-10;
+  auto basis = make_ccpvdz(mol, SphericalType(true));
+  for (auto& sh : basis) sh.set_shell_tolerance(shell_tol);
+  const int32_t nbf = basis.nbf();
+  auto eval = make_evaluator(basis, shell_tol);
+  const OrbitalEvaluator& ceval = eval;
+
+  auto grid = CubeGrid::from_molecule(mol, 12, 12, 12);
+  const auto npts = static_cast<size_t>(grid.num_points());
+
+  const auto C = make_random_vector(static_cast<size_t>(nbf), 271828u);
+  std::vector<double> D(static_cast<size_t>(nbf) * nbf, 0.0);
+  for (int32_t i = 0; i < nbf; ++i) D[static_cast<size_t>(i) * nbf + i] = 1.0;
+
+  auto run = [&](double* orb, double* rho) {
+    ceval.eval_orbital(grid, C.data(), orb);
+    ceval.eval_density(grid, D.data(), nbf, rho);
+  };
+
+  std::vector<double> orb_ref(npts), rho_ref(npts);
+  run(orb_ref.data(), rho_ref.data());
+  double max_ref = 0.0;
+  for (size_t p = 0; p < npts; ++p) max_ref = std::max(max_ref, rho_ref[p]);
+  REQUIRE(max_ref > 1e-2);
+
+  constexpr int nrunners = 3;
+  std::vector<double> orb(npts * nrunners), rho(npts * nrunners);
+
+  SECTION("concurrent std::threads on the same evaluator") {
+    std::vector<std::thread> pool;
+    for (int t = 0; t < nrunners; ++t)
+      pool.emplace_back([&, t] {
+        run(orb.data() + t * npts, rho.data() + t * npts);
+      });
+    for (auto& th : pool) th.join();
+  }
+
+#ifdef _OPENMP
+  SECTION("evaluation from inside an enclosing parallel region") {
+#pragma omp parallel for num_threads(nrunners) schedule(static, 1)
+    for (int t = 0; t < nrunners; ++t)
+      run(orb.data() + static_cast<size_t>(t) * npts,
+          rho.data() + static_cast<size_t>(t) * npts);
+  }
+#endif
+
+  size_t orb_diff = 0, rho_diff = 0;
+  for (size_t t = 0; t < nrunners; ++t)
+    for (size_t p = 0; p < npts; ++p) {
+      if (orb[t * npts + p] != orb_ref[p]) ++orb_diff;
+      if (rho[t * npts + p] != rho_ref[p]) ++rho_diff;
+    }
+  CHECK(orb_diff == 0);
+  CHECK(rho_diff == 0);
 }
 
 TEST_CASE("OrbitalEvaluator results do not depend on the thread count",
