@@ -69,22 +69,30 @@ namespace {
 
 /** @brief Choose the number of points evaluated per batch.
  *
- *  Two constraints, whichever is tighter:
- *    1. Cache footprint of the blocks that scale with the batch. Each thread
- *       holds `nscratch` live blocks of nbf*batch doubles: the AO block, the
- *       collocation kernel's own transpose staging, and, for density, the
- *       D*AO product. They are sized to share ~1 MiB, a typical per-core L2,
- *       rather than allowing each block that much on its own.
- *    2. Load balance: at least kMinBatches batches, so that every thread of a
- *       wide machine gets several.
+ *  Three bounds, listed by which one binds as the basis grows.
  *
- *  The second bound is a fixed count rather than a multiple of the thread
- *  count. Batch shape decides which shells screen out, so taking the thread
- *  count here would make the numbers depend on it. 1024 covers 256 threads at
- *  four batches each, and the batches it forces on a narrower machine cost
- *  little: against a run with the bound lifted entirely, benzene/cc-pVDZ at
- *  64^3 serial was ~4% slower on orbitals and ~10% faster on density, and
- *  water was faster on both at 1 and 16 threads.
+ *  1. Cache footprint, on small and medium bases. Each thread holds `nscratch`
+ *     live blocks of nbf*batch doubles -- the AO block, the collocation
+ *     kernel's own transpose staging, and, for density, the D*AO product --
+ *     sized to share ~1 MiB, a typical per-core L2, rather than allowing each
+ *     block that much on its own.
+ *
+ *  2. A minimum batch count, so every thread of a wide machine gets several.
+ *     Fixed rather than a multiple of the thread count: batch shape decides
+ *     which shells screen out, so taking the thread count here would make the
+ *     numbers depend on it. 1024 covers 256 threads at four batches each and
+ *     costs a few percent either way on a narrower one.
+ *
+ *  3. A floor, which is what binds on large bases. The cache bound keeps
+ *     shrinking with nbf -- six points at ubiquitin/cc-pVDZ -- while the
+ *     measured optimum does not: a batch that thin cannot amortise the
+ *     per-batch nbe*nbe gather and leaves the GEMM too skinny to run well.
+ *     Serial CPU time over batches of 32/64/128/256/512 puts the optimum at
+ *     32-64 for both taxol (nbf 1099) and ubiquitin (nbf 11577), with 128
+ *     costing ~10% and 512 costing 2.5x. Above nbf ~340 this floor, not the
+ *     cache bound, sets the batch, so the ~1 MiB target is not met there.
+ *     It does not defeat bound 2: at 64 points a batch, any grid of 65536
+ *     points or more already yields the 1024 batches that bound asks for.
  *
  *  Only the batch-proportional blocks are budgeted here. The gathers that
  *  depend on nbe alone -- D compressed to nbe*nbe, C compressed to nbe*nmo --
@@ -93,7 +101,7 @@ namespace {
  */
 size_t choose_batch_size( int32_t nbf, size_t npts, int nscratch ) {
   constexpr size_t kTargetScratchBytesPerThread = 1024 * 1024;
-  constexpr size_t kMinBatch = 128;
+  constexpr size_t kMinBatch = 64;
   constexpr size_t kMaxBatch = 8192;
   constexpr size_t kMinBatches = 1024;
 
