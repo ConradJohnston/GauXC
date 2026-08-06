@@ -644,6 +644,9 @@ void check_density_args( const std::string& ctx, int32_t nbf, const double* D,
     GAUXC_GENERIC_EXCEPTION( ctx + ": null pointer argument." );
   if( ldd < static_cast<size_t>(nbf) )
     GAUXC_GENERIC_EXCEPTION( ctx + ": ldd must be >= nbf()." );
+  // ldd reaches blas::gemm through eval_xmat, which narrows it to int32_t.
+  if( ldd > static_cast<size_t>(std::numeric_limits<int32_t>::max()) )
+    GAUXC_GENERIC_EXCEPTION( ctx + ": ldd exceeds BLAS int range." );
 }
 
 }  // namespace
