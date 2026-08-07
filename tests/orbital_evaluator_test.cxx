@@ -1352,7 +1352,14 @@ TEST_CASE("write_cube agrees with snprintf %13.5E formatting", "[cube]") {
   std::ostringstream expected;
   for (size_t i = 0; i < field.size(); ++i) {
     char buf[32];
-    std::snprintf(buf, sizeof(buf), "%13.5E", field[i]);
+    // C99 leaves the sign of a printed NaN implementation-defined: glibc emits
+    // it, BSD libc does not, so snprintf is not a portable reference for that
+    // one value. The formatter deliberately emits it, which is pinned here.
+    if (std::isnan(field[i]))
+      std::snprintf(buf, sizeof(buf), "%13s",
+                    std::signbit(field[i]) ? "-NAN" : "NAN");
+    else
+      std::snprintf(buf, sizeof(buf), "%13.5E", field[i]);
     expected << buf;
     if ((i + 1) % 6 == 0 || (i + 1) == field.size()) expected << '\n';
   }
